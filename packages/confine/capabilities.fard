@@ -1,0 +1,29 @@
+import("std/rec") as rec
+import("std/list") as list
+import("std/type") as type
+import("./canonical") as canonical
+
+fn validate(capabilities) {
+  if type.of(capabilities) != "record" then { t: "err", code: "CAPABILITIES_NOT_RECORD" }
+  else if !rec.has(capabilities, "actors") || type.of(capabilities.actors) != "record" then { t: "err", code: "CAPABILITIES_MISSING_ACTORS" }
+  else if !rec.has(capabilities, "operations") || type.of(capabilities.operations) != "record" then { t: "err", code: "CAPABILITIES_MISSING_OPERATIONS" }
+  else { t: "ok", v: capabilities }
+}
+
+fn actor(capabilities, actor_id) { rec.get(capabilities.actors, actor_id) }
+
+fn operation_allowed(capabilities, actor_id, operation) {
+  let a = actor(capabilities, actor_id) in
+  if a == null then false
+  else if !rec.has(a, "operations") || type.of(a.operations) != "list" then false
+  else list.any(a.operations, fn(op) { op == operation })
+}
+
+fn actor_role(capabilities, actor_id) {
+  let a = actor(capabilities, actor_id) in
+  if a == null || !rec.has(a, "role") then null else a.role
+}
+
+fn digest(capabilities) { canonical.tagged_digest("confine.capabilities.v1", capabilities) }
+
+export { validate, actor, operation_allowed, actor_role, digest }

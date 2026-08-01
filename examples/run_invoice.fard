@@ -1,0 +1,49 @@
+import("std/json") as json
+import("../packages/confine/config") as config_mod
+import("../packages/confine/state") as state_mod
+import("../packages/confine/engine") as engine
+import("../packages/confine/labels") as labels
+import("./invoice_config") as invoice_config
+
+let secret = "replace-at-runtime-with-at-least-32-bytes-of-secret-material"
+let config = invoice_config.build(secret)
+let valid = config_mod.validate(config)
+
+let state0 = state_mod.initial(config)
+let p1 = {
+  t: "create_draft",
+  thread_id: "thread_001",
+  invoice_id: "inv_001",
+  customer_id: "cust_001",
+  body: "Invoice inv_001 remains overdue. Please review the outstanding balance.",
+  body_label: labels.customer_label("cust_001"),
+  nonce: "nonce-draft-0001",
+  expected_state_hash: state_mod.hash_state(state0)
+}
+let r1 = engine.apply_with_receipt(state0, p1, "drafter_1", config.capabilities, config.policy, config.broker_secret)
+let state1 = r1.state
+let p2 = {
+  t: "approve_draft",
+  draft_hash: r1.result.draft_hash,
+  approver_id: "approver_1",
+  nonce: "nonce-approve-001",
+  expected_state_hash: state_mod.hash_state(state1)
+}
+let r2 = engine.apply_with_receipt(state1, p2, "approver_1", config.capabilities, config.policy, config.broker_secret)
+let state2 = r2.state
+let p3 = {
+  t: "submit_draft",
+  draft_hash: r1.result.draft_hash,
+  recipient: "billing@example.test",
+  recipient_label: labels.customer_label("cust_001"),
+  nonce: "nonce-submit-0001",
+  expected_state_hash: state_mod.hash_state(state2)
+}
+let r3 = engine.apply_with_receipt(state2, p3, "approver_1", config.capabilities, config.policy, config.broker_secret)
+
+{
+  config_valid: valid.t == "ok",
+  draft: r1,
+  approval: r2,
+  submission: r3
+}

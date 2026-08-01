@@ -1,0 +1,43 @@
+import("../packages/confine/labels") as labels
+
+fn build(broker_secret) {
+  {
+    broker_secret: broker_secret,
+    policy_version: "invoice-policy-v1",
+    policy: {
+      version: "invoice-policy-v1",
+      min_nonce_length: 12,
+      max_draft_chars: 2000,
+      max_total_drafts: 100,
+      max_total_submissions: 20,
+      approver_role: "approver",
+      require_separation_of_duties: true,
+      approved_recipients: {
+        cust_001: ["billing@example.test"],
+        cust_002: ["accounts@example.test"]
+      }
+    },
+    capabilities: {
+      operations: {
+        read_invoice: true,
+        create_draft: true,
+        approve_draft: true,
+        submit_draft: true
+      },
+      actors: {
+        drafter_1: { role: "drafter", operations: ["read_invoice", "create_draft"] },
+        approver_1: { role: "approver", operations: ["read_invoice", "approve_draft", "submit_draft"] }
+      }
+    },
+    invoices: {
+      inv_001: { invoice_id: "inv_001", customer_id: "cust_001", status: "overdue", amount_cents: 4200, label: labels.customer_label("cust_001") },
+      inv_002: { invoice_id: "inv_002", customer_id: "cust_002", status: "paid", amount_cents: 9900, label: labels.customer_label("cust_002") }
+    },
+    threads: {
+      thread_001: { thread_id: "thread_001", customer_id: "cust_001" },
+      thread_002: { thread_id: "thread_002", customer_id: "cust_002" }
+    }
+  }
+}
+
+export { build }

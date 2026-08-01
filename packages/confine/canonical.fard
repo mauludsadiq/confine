@@ -1,0 +1,61 @@
+import("std/json") as json
+import("std/hash") as hash
+import("std/str") as str
+import("std/type") as type
+import("std/rec") as rec
+import("std/list") as list
+
+fn canonical_text(value) {
+  json.canonicalize(value)
+}
+
+fn digest(value) {
+  hash.sha256_text(canonical_text(value))
+}
+
+fn tagged_digest(tag, value) {
+  hash.sha256_text(str.concat([tag, "\n", canonical_text(value)]))
+}
+
+fn require_record(value, code) {
+  if type.of(value) == "record" then { t: "ok", v: value }
+  else { t: "err", code: code, data: { expected: "record", actual: type.of(value) } }
+}
+
+fn require_text_field(r, key, code) {
+  if !rec.has(r, key) then { t: "err", code: code, data: { field: key, problem: "missing" } }
+  else
+    let v = rec.get(r, key) in
+    if type.of(v) == "text" then { t: "ok", v: v }
+    else { t: "err", code: code, data: { field: key, expected: "text", actual: type.of(v) } }
+}
+
+fn require_int_field(r, key, code) {
+  if !rec.has(r, key) then { t: "err", code: code, data: { field: key, problem: "missing" } }
+  else
+    let v = rec.get(r, key) in
+    if type.of(v) == "int" then { t: "ok", v: v }
+    else { t: "err", code: code, data: { field: key, expected: "int", actual: type.of(v) } }
+}
+
+fn require_bool_field(r, key, code) {
+  if !rec.has(r, key) then { t: "err", code: code, data: { field: key, problem: "missing" } }
+  else
+    let v = rec.get(r, key) in
+    if type.of(v) == "bool" then { t: "ok", v: v }
+    else { t: "err", code: code, data: { field: key, expected: "bool", actual: type.of(v) } }
+}
+
+fn no_unknown_fields(r, allowed) {
+  let keys = rec.keys(r) in
+  let bad = list.find(keys, fn(k) { !list.any(allowed, fn(a) { a == k }) }) in
+  if rec.has(bad, "some") then
+    { t: "err", code: "UNKNOWN_FIELD", data: { field: bad.some } }
+  else { t: "ok", v: r }
+}
+
+fn valid_sha256(s) {
+  type.of(s) == "text" && str.starts_with(s, "sha256:") && str.len(s) == 71
+}
+
+export { canonical_text, digest, tagged_digest, require_record, require_text_field, require_int_field, require_bool_field, no_unknown_fields, valid_sha256 }

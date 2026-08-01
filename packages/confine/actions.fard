@@ -1,0 +1,83 @@
+import("std/type") as type
+import("std/rec") as rec
+import("std/list") as list
+import("./canonical") as canonical
+import("./labels") as labels
+
+fn parse_read_invoice(r) {
+  let fields = canonical.no_unknown_fields(r, ["t", "invoice_id", "nonce", "expected_state_hash"]) in
+  if fields.t == "err" then fields else
+  let invoice_id = canonical.require_text_field(r, "invoice_id", "BAD_READ_INVOICE") in
+  if invoice_id.t == "err" then invoice_id else
+  let nonce = canonical.require_text_field(r, "nonce", "BAD_READ_INVOICE") in
+  if nonce.t == "err" then nonce else
+  let state_hash = canonical.require_text_field(r, "expected_state_hash", "BAD_READ_INVOICE") in
+  if state_hash.t == "err" then state_hash else
+  if !canonical.valid_sha256(state_hash.v) then { t: "err", code: "BAD_STATE_HASH" }
+  else { t: "ok", v: { t: "read_invoice", invoice_id: invoice_id.v, nonce: nonce.v, expected_state_hash: state_hash.v } }
+}
+
+fn parse_create_draft(r) {
+  let fields = canonical.no_unknown_fields(r, ["t", "thread_id", "invoice_id", "customer_id", "body", "body_label", "nonce", "expected_state_hash"]) in
+  if fields.t == "err" then fields else
+  let thread_id = canonical.require_text_field(r, "thread_id", "BAD_CREATE_DRAFT") in
+  if thread_id.t == "err" then thread_id else
+  let invoice_id = canonical.require_text_field(r, "invoice_id", "BAD_CREATE_DRAFT") in
+  if invoice_id.t == "err" then invoice_id else
+  let customer_id = canonical.require_text_field(r, "customer_id", "BAD_CREATE_DRAFT") in
+  if customer_id.t == "err" then customer_id else
+  let body = canonical.require_text_field(r, "body", "BAD_CREATE_DRAFT") in
+  if body.t == "err" then body else
+  let nonce = canonical.require_text_field(r, "nonce", "BAD_CREATE_DRAFT") in
+  if nonce.t == "err" then nonce else
+  let state_hash = canonical.require_text_field(r, "expected_state_hash", "BAD_CREATE_DRAFT") in
+  if state_hash.t == "err" then state_hash else
+  if !rec.has(r, "body_label") || !labels.valid(r.body_label) then { t: "err", code: "BAD_BODY_LABEL" }
+  else if !canonical.valid_sha256(state_hash.v) then { t: "err", code: "BAD_STATE_HASH" }
+  else { t: "ok", v: { t: "create_draft", thread_id: thread_id.v, invoice_id: invoice_id.v, customer_id: customer_id.v, body: body.v, body_label: r.body_label, nonce: nonce.v, expected_state_hash: state_hash.v } }
+}
+
+fn parse_approve_draft(r) {
+  let fields = canonical.no_unknown_fields(r, ["t", "draft_hash", "approver_id", "nonce", "expected_state_hash"]) in
+  if fields.t == "err" then fields else
+  let draft_hash = canonical.require_text_field(r, "draft_hash", "BAD_APPROVE_DRAFT") in
+  if draft_hash.t == "err" then draft_hash else
+  let approver_id = canonical.require_text_field(r, "approver_id", "BAD_APPROVE_DRAFT") in
+  if approver_id.t == "err" then approver_id else
+  let nonce = canonical.require_text_field(r, "nonce", "BAD_APPROVE_DRAFT") in
+  if nonce.t == "err" then nonce else
+  let state_hash = canonical.require_text_field(r, "expected_state_hash", "BAD_APPROVE_DRAFT") in
+  if state_hash.t == "err" then state_hash else
+  if !canonical.valid_sha256(draft_hash.v) || !canonical.valid_sha256(state_hash.v) then { t: "err", code: "BAD_HASH" }
+  else { t: "ok", v: { t: "approve_draft", draft_hash: draft_hash.v, approver_id: approver_id.v, nonce: nonce.v, expected_state_hash: state_hash.v } }
+}
+
+fn parse_submit_draft(r) {
+  let fields = canonical.no_unknown_fields(r, ["t", "draft_hash", "recipient", "recipient_label", "nonce", "expected_state_hash"]) in
+  if fields.t == "err" then fields else
+  let draft_hash = canonical.require_text_field(r, "draft_hash", "BAD_SUBMIT_DRAFT") in
+  if draft_hash.t == "err" then draft_hash else
+  let recipient = canonical.require_text_field(r, "recipient", "BAD_SUBMIT_DRAFT") in
+  if recipient.t == "err" then recipient else
+  let nonce = canonical.require_text_field(r, "nonce", "BAD_SUBMIT_DRAFT") in
+  if nonce.t == "err" then nonce else
+  let state_hash = canonical.require_text_field(r, "expected_state_hash", "BAD_SUBMIT_DRAFT") in
+  if state_hash.t == "err" then state_hash else
+  if !rec.has(r, "recipient_label") || !labels.valid(r.recipient_label) then { t: "err", code: "BAD_RECIPIENT_LABEL" }
+  else if !canonical.valid_sha256(draft_hash.v) || !canonical.valid_sha256(state_hash.v) then { t: "err", code: "BAD_HASH" }
+  else { t: "ok", v: { t: "submit_draft", draft_hash: draft_hash.v, recipient: recipient.v, recipient_label: r.recipient_label, nonce: nonce.v, expected_state_hash: state_hash.v } }
+}
+
+fn parse(proposal) {
+  if type.of(proposal) != "record" then { t: "err", code: "PROPOSAL_NOT_RECORD" }
+  else if !rec.has(proposal, "t") || type.of(proposal.t) != "text" then { t: "err", code: "MISSING_ACTION_TAG" }
+  else if proposal.t == "read_invoice" then parse_read_invoice(proposal)
+  else if proposal.t == "create_draft" then parse_create_draft(proposal)
+  else if proposal.t == "approve_draft" then parse_approve_draft(proposal)
+  else if proposal.t == "submit_draft" then parse_submit_draft(proposal)
+  else { t: "err", code: "UNKNOWN_ACTION", data: { action: proposal.t } }
+}
+
+fn action_hash(action) { canonical.tagged_digest("confine.action.v1", action) }
+
+export { parse, action_hash }

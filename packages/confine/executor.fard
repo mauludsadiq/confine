@@ -1,0 +1,88 @@
+import("std/rec") as rec
+import("std/list") as list
+import("./canonical") as canonical
+import("./actions") as actions
+import("./state") as state_mod
+import("./certificate") as certificate_mod
+import("./policy") as policy_mod
+
+// TRUST BOUNDARY NOTE: execute_exact() is the final authority boundary.
+// It independently verifies the certificate's MAC/hashes AND independently
+// recomputes the expected obligations for the action via
+// policy_mod.obligations_for_action(), rejecting if the certificate's
+// obligations don't match exactly. This means execute_exact() does not
+// rely on the caller (engine.apply_with_receipt or any future adapter)
+// having derived obligations correctly at issuance time.
+
+fn execute_read_invoice(state, action, actor_id) {
+  let invoice = state_mod.get_invoice(state, action.invoice_id) in
+  let next = {
+    ...state,
+    sequence: state.sequence + 1,
+    consumed_nonces: state_mod.consume_nonce_map(state, action.nonce)
+  } in
+  { t: "ok", result: { t: "invoice_status", invoice_id: action.invoice_id, status: invoice.status, amount_cents: invoice.amount_cents, customer_id: invoice.customer_id, label: invoice.label }, state: next }
+}
+
+fn execute_create_draft(state, action, actor_id) {
+  let draft_content = { thread_id: action.thread_id, invoice_id: action.invoice_id, customer_id: action.customer_id, body: action.body, body_label: action.body_label, created_by: actor_id } in
+  let draft_hash = canonical.tagged_digest("confine.draft.v1", draft_content) in
+  let draft = { ...draft_content, draft_hash: draft_hash, submitted: false } in
+  let next = {
+    ...state,
+    sequence: state.sequence + 1,
+    drafts: rec.set(state.drafts, draft_hash, draft),
+    consumed_nonces: state_mod.consume_nonce_map(state, action.nonce),
+    counters: { ...state.counters, drafted_total: state.counters.drafted_total + 1 }
+  } in
+  { t: "ok", result: { t: "draft_created", draft_hash: draft_hash, draft: draft }, state: next }
+}
+
+fn execute_approve_draft(state, action, actor_id) {
+  let approval = { draft_hash: action.draft_hash, approver_id: actor_id, sequence: state.sequence } in
+  let next = {
+    ...state,
+    sequence: state.sequence + 1,
+    approvals: rec.set(state.approvals, action.draft_hash, approval),
+    consumed_nonces: state_mod.consume_nonce_map(state, action.nonce),
+    counters: { ...state.counters, approved_total: state.counters.approved_total + 1 }
+  } in
+  { t: "ok", result: { t: "draft_approved", approval: approval }, state: next }
+}
+
+fn execute_submit_draft(state, action, actor_id) {
+  let draft = state_mod.get_draft(state, action.draft_hash) in
+  let submitted_draft = { ...draft, submitted: true, submitted_to: action.recipient } in
+  let external_effect = {
+    t: "email_submission",
+    recipient: action.recipient,
+    recipient_label: action.recipient_label,
+    thread_id: draft.thread_id,
+    body: draft.body,
+    body_hash: canonical.tagged_digest("confine.body.v1", draft.body),
+    draft_hash: action.draft_hash
+  } in
+  let next = {
+    ...state,
+    sequence: state.sequence + 1,
+    drafts: rec.set(state.drafts, action.draft_hash, submitted_draft),
+    submissions: list.append(state.submissions, external_effect),
+    consumed_nonces: state_mod.consume_nonce_map(state, action.nonce),
+    counters: { ...state.counters, submitted_total: state.counters.submitted_total + 1 }
+  } in
+  { t: "ok", result: { t: "draft_submitted", effect: external_effect }, state: next }
+}
+
+fn execute_exact(state, action, actor_id, capabilities, policy, certificate, broker_secret) {
+  let cv = certificate_mod.verify(certificate, state, action, actor_id, capabilities, policy, broker_secret) in
+  if cv.t == "err" then cv
+  else if state_mod.nonce_consumed(state, action.nonce) then { t: "err", code: "NONCE_REPLAY_AT_EXECUTOR" }
+  else if canonical.canonical_text(certificate.obligations) != canonical.canonical_text(policy_mod.obligations_for_action(state, action)) then { t: "err", code: "CERTIFICATE_OBLIGATION_MISMATCH" }
+  else if action.t == "read_invoice" then execute_read_invoice(state, action, actor_id)
+  else if action.t == "create_draft" then execute_create_draft(state, action, actor_id)
+  else if action.t == "approve_draft" then execute_approve_draft(state, action, actor_id)
+  else if action.t == "submit_draft" then execute_submit_draft(state, action, actor_id)
+  else { t: "err", code: "EXECUTOR_UNKNOWN_ACTION" }
+}
+
+export { execute_exact }

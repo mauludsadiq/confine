@@ -1,0 +1,265 @@
+import("std/rec") as rec
+import("../packages/confine/config") as config_mod
+import("../packages/confine/state") as state_mod
+import("../packages/confine/engine") as engine
+import("../packages/confine/labels") as labels
+import("../packages/confine/receipts") as receipts
+import("../examples/invoice_config") as invoice_config
+import("../packages/confine/certificate") as certificate_mod
+import("../packages/confine/executor") as executor
+import("../packages/confine/policy") as policy_mod
+
+fn cfg() { invoice_config.build("0123456789abcdef0123456789abcdef") }
+
+fn create_draft(state, customer_id, invoice_id, thread_id, nonce, body_label, actor_id) {
+  let c = cfg() in
+  engine.apply_with_receipt(state, {
+    t: "create_draft",
+    thread_id: thread_id,
+    invoice_id: invoice_id,
+    customer_id: customer_id,
+    body: "Please review the outstanding invoice.",
+    body_label: body_label,
+    nonce: nonce,
+    expected_state_hash: state_mod.hash_state(state)
+  }, actor_id, c.capabilities, c.policy, c.broker_secret)
+}
+
+test "configuration validates" {
+  config_mod.validate(cfg()).t == "ok"
+}
+
+test "genuine transition commits and receipt verifies" {
+  let c = cfg() in
+  let s = state_mod.initial(c) in
+  let r = create_draft(s, "cust_001", "inv_001", "thread_001", "nonce-test-0001", labels.customer_label("cust_001"), "drafter_1") in
+  r.t == "committed" && receipts.verify(r.receipt).t == "ok"
+}
+
+test "unknown action is rejected at parse boundary" {
+  let c = cfg() in
+  let s = state_mod.initial(c) in
+  let r = engine.apply_with_receipt(s, { t: "shell", command: "whoami" }, "drafter_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.stage == "parse"
+}
+
+test "unknown fields are rejected" {
+  let c = cfg() in
+  let s = state_mod.initial(c) in
+  let r = engine.apply_with_receipt(s, {
+    t: "read_invoice",
+    invoice_id: "inv_001",
+    nonce: "nonce-test-0002",
+    expected_state_hash: state_mod.hash_state(s),
+    command: "hidden"
+  }, "drafter_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.stage == "parse"
+}
+
+test "customer data cannot flow to another customer label" {
+  let c = cfg() in
+  let s = state_mod.initial(c) in
+  let r = create_draft(s, "cust_001", "inv_001", "thread_001", "nonce-test-0003", labels.customer_label("cust_002"), "drafter_1") in
+  r.t == "rejected" && r.stage == "policy" && r.error.code == "IFC_INVOICE_TO_BODY"
+}
+
+test "capability denial blocks approver operation by drafter" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0004", labels.customer_label("cust_001"), "drafter_1") in
+  let r = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "drafter_1",
+    nonce: "nonce-test-0005",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "drafter_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "CAPABILITY_DENIED"
+}
+
+test "stale state is rejected" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0006", labels.customer_label("cust_001"), "drafter_1") in
+  let r = engine.apply_with_receipt(d.state, {
+    t: "read_invoice",
+    invoice_id: "inv_001",
+    nonce: "nonce-test-0007",
+    expected_state_hash: state_mod.hash_state(s0)
+  }, "drafter_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "STALE_STATE"
+}
+
+test "nonce replay is rejected" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0008", labels.customer_label("cust_001"), "drafter_1") in
+  let r = engine.apply_with_receipt(d.state, {
+    t: "read_invoice",
+    invoice_id: "inv_001",
+    nonce: "nonce-test-0008",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "drafter_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "NONCE_REPLAY"
+}
+
+test "submission requires approval" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0009", labels.customer_label("cust_001"), "drafter_1") in
+  let r = engine.apply_with_receipt(d.state, {
+    t: "submit_draft",
+    draft_hash: d.result.draft_hash,
+    recipient: "billing@example.test",
+    recipient_label: labels.customer_label("cust_001"),
+    nonce: "nonce-test-0010",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "APPROVAL_REQUIRED"
+}
+
+test "unapproved recipient is rejected" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0011", labels.customer_label("cust_001"), "drafter_1") in
+  let a = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-test-0012",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  let r = engine.apply_with_receipt(a.state, {
+    t: "submit_draft",
+    draft_hash: d.result.draft_hash,
+    recipient: "attacker@example.test",
+    recipient_label: labels.customer_label("cust_001"),
+    nonce: "nonce-test-0013",
+    expected_state_hash: state_mod.hash_state(a.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "RECIPIENT_NOT_APPROVED"
+}
+
+test "valid three-transition receipt chain verifies" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0014", labels.customer_label("cust_001"), "drafter_1") in
+  let a = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-test-0015",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  let s = engine.apply_with_receipt(a.state, {
+    t: "submit_draft",
+    draft_hash: d.result.draft_hash,
+    recipient: "billing@example.test",
+    recipient_label: labels.customer_label("cust_001"),
+    nonce: "nonce-test-0016",
+    expected_state_hash: state_mod.hash_state(a.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  receipts.verify_chain([d.receipt, a.receipt, s.receipt]).t == "ok"
+}
+
+test "tampered receipt is rejected" {
+  let c = cfg() in
+  let s = state_mod.initial(c) in
+  let r = create_draft(s, "cust_001", "inv_001", "thread_001", "nonce-test-0017", labels.customer_label("cust_001"), "drafter_1") in
+  let tampered = { ...r.receipt, payload: { ...r.receipt.payload, actor_id: "attacker" } } in
+  receipts.verify(tampered).t == "err"
+}
+
+test "broken receipt chain is rejected" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d1 = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0018", labels.customer_label("cust_001"), "drafter_1") in
+  let d2 = create_draft(d1.state, "cust_001", "inv_001", "thread_001", "nonce-test-0019", labels.customer_label("cust_001"), "drafter_1") in
+  let broken = { ...d2.receipt, payload: { ...d2.receipt.payload, previous_receipt_hash: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" } } in
+  let rehashed = { ...broken, receipt_hash: receipts.create(d1.state, d2.action, "drafter_1", d2.certificate, d2.result, d2.state).receipt_hash } in
+  receipts.verify_chain([d1.receipt, rehashed]).t == "err"
+}
+
+test "executor rejects obligation content that does not match action" {
+  // Regression test for a real trust-boundary bug: execute_exact() now
+  // independently recomputes expected obligations via
+  // policy_mod.obligations_for_action(state, action) and rejects any
+  // certificate whose signed obligations don't match exactly -- even
+  // though the certificate's MAC, action_hash, and all other fields are
+  // valid. This closes the gap where a certificate issuer other than
+  // engine.apply_with_receipt() (e.g. a future external adapter) could
+  // sign a certificate with obligations that describe a different action
+  // than the one actually executed.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0020", labels.customer_label("cust_001"), "drafter_1") in
+  let a = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-test-0021",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+
+  let action = {
+    t: "submit_draft",
+    draft_hash: d.result.draft_hash,
+    recipient: "billing@example.test",
+    recipient_label: labels.customer_label("cust_001"),
+    nonce: "nonce-test-0022",
+    expected_state_hash: state_mod.hash_state(a.state)
+  } in
+
+  let mismatched_obligations = [
+    { t: "submit_exact_hash", draft_hash: d.result.draft_hash },
+    { t: "recipient", recipient: "attacker@evil.test" }
+  ] in
+
+  let certificate = certificate_mod.issue(
+    a.state, action, "approver_1", c.capabilities, c.policy, mismatched_obligations, c.broker_secret
+  ) in
+
+  let executed = executor.execute_exact(
+    a.state, action, "approver_1", c.capabilities, c.policy, certificate, c.broker_secret
+  ) in
+
+  executed.t == "err" && executed.code == "CERTIFICATE_OBLIGATION_MISMATCH"
+}
+
+test "read_invoice obligation depends on state; whole-state hash pinning prevents inconsistency" {
+  // obligations_for_read_invoice(state, action) is the only obligation
+  // constructor that reads `state` (it looks up invoice.label). This test
+  // proves that even though the obligation itself is state-dependent, an
+  // attempt to execute a certificate against a state that has drifted from
+  // the one it was issued against is rejected -- not by the obligation
+  // recheck, but by certificate_mod.verify()'s prior_state_hash pin, which
+  // covers the entire state and runs first. This is why the state-dependency
+  // in obligations_for_read_invoice is currently safe: no action mutates
+  // invoice labels, and even if state drifted for any reason, the whole-state
+  // hash catches it before CERTIFICATE_OBLIGATION_MISMATCH would even apply.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let action = {
+    t: "read_invoice",
+    invoice_id: "inv_001",
+    nonce: "nonce-test-0030",
+    expected_state_hash: state_mod.hash_state(s0)
+  } in
+  let obligations = policy_mod.obligations_for_action(s0, action) in
+  let certificate = certificate_mod.issue(
+    s0, action, "drafter_1", c.capabilities, c.policy, obligations, c.broker_secret
+  ) in
+
+  // Hypothetically mutate the invoice's label in state -- no current action
+  // can actually do this, but constructing it directly tests whether the
+  // executor would catch the drift, and via which mechanism.
+  let original_invoice = rec.get(s0.invoices, "inv_001") in
+  let mutated_invoice = { ...original_invoice, label: labels.customer_label("cust_999") } in
+  let s1 = { ...s0, invoices: rec.set(s0.invoices, "inv_001", mutated_invoice) } in
+
+  let executed = executor.execute_exact(
+    s1, action, "drafter_1", c.capabilities, c.policy, certificate, c.broker_secret
+  ) in
+
+  executed.t == "err" && executed.code == "CERTIFICATE_STATE_MISMATCH"
+}

@@ -1,0 +1,54 @@
+import("std/hash") as hash
+import("std/str") as str
+import("std/rec") as rec
+import("./canonical") as canonical
+import("./actions") as actions
+import("./state") as state_mod
+import("./policy") as policy_mod
+import("./capabilities") as capabilities_mod
+
+fn unsigned_certificate(state, action, actor_id, capabilities, policy, obligations) {
+  {
+    t: "transition_certificate",
+    version: 1,
+    prior_state_hash: state_mod.hash_state(state),
+    action_hash: actions.action_hash(action),
+    actor_id: actor_id,
+    policy_hash: policy_mod.digest(policy),
+    capability_hash: capabilities_mod.digest(capabilities),
+    nonce: action.nonce,
+    sequence: state.sequence,
+    obligations: obligations
+  }
+}
+
+fn mac(secret, unsigned) {
+  hash.sha256_text(str.concat(["confine.certificate.mac.v1\n", secret, "\n", canonical.canonical_text(unsigned)]))
+}
+
+fn issue(state, action, actor_id, capabilities, policy, obligations, broker_secret) {
+  let unsigned = unsigned_certificate(state, action, actor_id, capabilities, policy, obligations) in
+  { ...unsigned, mac: mac(broker_secret, unsigned) }
+}
+
+fn strip_mac(certificate) { rec.remove(certificate, "mac") }
+
+fn verify(certificate, state, action, actor_id, capabilities, policy, broker_secret) {
+  if !rec.has(certificate, "mac") then { t: "err", code: "CERTIFICATE_MISSING_MAC" }
+  else
+    let unsigned = strip_mac(certificate) in
+    let expected_mac = mac(broker_secret, unsigned) in
+    if certificate.mac != expected_mac then { t: "err", code: "CERTIFICATE_MAC_MISMATCH" }
+    else if certificate.prior_state_hash != state_mod.hash_state(state) then { t: "err", code: "CERTIFICATE_STATE_MISMATCH" }
+    else if certificate.action_hash != actions.action_hash(action) then { t: "err", code: "CERTIFICATE_ACTION_MISMATCH" }
+    else if certificate.actor_id != actor_id then { t: "err", code: "CERTIFICATE_ACTOR_MISMATCH" }
+    else if certificate.policy_hash != policy_mod.digest(policy) then { t: "err", code: "CERTIFICATE_POLICY_MISMATCH" }
+    else if certificate.capability_hash != capabilities_mod.digest(capabilities) then { t: "err", code: "CERTIFICATE_CAPABILITY_MISMATCH" }
+    else if certificate.nonce != action.nonce then { t: "err", code: "CERTIFICATE_NONCE_MISMATCH" }
+    else if certificate.sequence != state.sequence then { t: "err", code: "CERTIFICATE_SEQUENCE_MISMATCH" }
+    else { t: "ok", v: certificate }
+}
+
+fn digest(certificate) { canonical.tagged_digest("confine.certificate.v1", certificate) }
+
+export { issue, verify, digest }

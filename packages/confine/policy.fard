@@ -1,0 +1,128 @@
+import("std/rec") as rec
+import("std/list") as list
+import("std/type") as type
+import("std/str") as str
+import("./canonical") as canonical
+import("./actions") as actions
+import("./state") as state_mod
+import("./labels") as labels
+import("./capabilities") as capabilities_mod
+
+fn deny(code, data) { { t: "deny", code: code, data: data } }
+fn allow(obligations) { { t: "allow", obligations: obligations } }
+
+// NOTE: this is the only obligations_for_* function that reads `state`
+// rather than being a pure function of `action`. That means the obligation
+// executor.fard recomputes at execution time could differ from what was
+// computed at issuance time if state changed in between -- specifically if
+// invoice.label were ever mutated by some action.
+//
+// This is currently safe ONLY because no action in this system mutates
+// state.invoices, AND because certificate_mod.verify() independently pins
+// the ENTIRE prior state via prior_state_hash before the obligation check
+// ever runs -- so any state drift (mutated or not) is caught by
+// CERTIFICATE_STATE_MISMATCH regardless of whether it happens to affect
+// this particular obligation. See test: "read_invoice obligation depends
+// on state; whole-state hash pinning prevents inconsistency" in
+// tests/test_confine.fard.
+//
+// If a future action is added that mutates invoice labels, this reasoning
+// must be re-verified -- do not assume the obligation recheck alone is
+// sufficient without the state-hash pin backing it up.
+fn obligations_for_read_invoice(state, action) {
+  let invoice = state_mod.get_invoice(state, action.invoice_id) in
+  [{ t: "result_label", label: invoice.label }]
+}
+
+fn obligations_for_create_draft(action) {
+  [{ t: "bind_customer", customer_id: action.customer_id }, { t: "body_label", label: action.body_label }]
+}
+
+fn obligations_for_approve_draft(action) {
+  [{ t: "approve_exact_hash", draft_hash: action.draft_hash }]
+}
+
+fn obligations_for_submit_draft(action) {
+  [{ t: "submit_exact_hash", draft_hash: action.draft_hash }, { t: "recipient", recipient: action.recipient }]
+}
+
+fn obligations_for_action(state, action) {
+  if action.t == "read_invoice" then obligations_for_read_invoice(state, action)
+  else if action.t == "create_draft" then obligations_for_create_draft(action)
+  else if action.t == "approve_draft" then obligations_for_approve_draft(action)
+  else if action.t == "submit_draft" then obligations_for_submit_draft(action)
+  else []
+}
+
+fn common_checks(state, action, actor_id, capabilities, policy) {
+  if state.policy_version != policy.version then deny("POLICY_VERSION_MISMATCH", { state: state.policy_version, policy: policy.version })
+  else if action.expected_state_hash != state_mod.hash_state(state) then deny("STALE_STATE", { expected: action.expected_state_hash, actual: state_mod.hash_state(state) })
+  else if state_mod.nonce_consumed(state, action.nonce) then deny("NONCE_REPLAY", { nonce: action.nonce })
+  else if str.len(action.nonce) < policy.min_nonce_length then deny("NONCE_TOO_SHORT", { minimum: policy.min_nonce_length })
+  else if !capabilities_mod.operation_allowed(capabilities, actor_id, action.t) then deny("CAPABILITY_DENIED", { actor_id: actor_id, operation: action.t })
+  else allow([])
+}
+
+fn verify_read_invoice(state, action, actor_id, capabilities, policy) {
+  let invoice = state_mod.get_invoice(state, action.invoice_id) in
+  if invoice == null then deny("INVOICE_NOT_FOUND", { invoice_id: action.invoice_id })
+  else allow(obligations_for_read_invoice(state, action))
+}
+
+fn verify_create_draft(state, action, actor_id, capabilities, policy) {
+  let invoice = state_mod.get_invoice(state, action.invoice_id) in
+  let thread = state_mod.get_thread(state, action.thread_id) in
+  if invoice == null then deny("INVOICE_NOT_FOUND", { invoice_id: action.invoice_id })
+  else if thread == null then deny("THREAD_NOT_FOUND", { thread_id: action.thread_id })
+  else if invoice.customer_id != action.customer_id then deny("INVOICE_CUSTOMER_MISMATCH", { invoice_customer: invoice.customer_id, action_customer: action.customer_id })
+  else if thread.customer_id != action.customer_id then deny("THREAD_CUSTOMER_MISMATCH", { thread_customer: thread.customer_id, action_customer: action.customer_id })
+  else if !labels.flows_to(invoice.label, action.body_label) then deny("IFC_INVOICE_TO_BODY", { source: invoice.label, sink: action.body_label })
+  else if action.body_label.kind != "customer" || action.body_label.owner != action.customer_id then deny("BODY_LABEL_OWNER_MISMATCH", { customer_id: action.customer_id, label: action.body_label })
+  else if str.len(action.body) == 0 then deny("EMPTY_DRAFT", {})
+  else if str.len(action.body) > policy.max_draft_chars then deny("DRAFT_TOO_LARGE", { actual: str.len(action.body), maximum: policy.max_draft_chars })
+  else if state.counters.drafted_total >= policy.max_total_drafts then deny("DRAFT_QUOTA", { maximum: policy.max_total_drafts })
+  else allow(obligations_for_create_draft(action))
+}
+
+fn verify_approve_draft(state, action, actor_id, capabilities, policy) {
+  let draft = state_mod.get_draft(state, action.draft_hash) in
+  let role = capabilities_mod.actor_role(capabilities, actor_id) in
+  if draft == null then deny("DRAFT_NOT_FOUND", { draft_hash: action.draft_hash })
+  else if role != policy.approver_role then deny("APPROVER_ROLE_REQUIRED", { required: policy.approver_role, actual: role })
+  else if actor_id != action.approver_id then deny("APPROVER_ID_MISMATCH", { actor_id: actor_id, approver_id: action.approver_id })
+  else if draft.created_by == actor_id && policy.require_separation_of_duties then deny("SEPARATION_OF_DUTIES", { actor_id: actor_id })
+  else if state_mod.get_approval(state, action.draft_hash) != null then deny("ALREADY_APPROVED", { draft_hash: action.draft_hash })
+  else allow(obligations_for_approve_draft(action))
+}
+
+fn recipient_allowed(policy, customer_id, recipient) {
+  let recipients = rec.get(policy.approved_recipients, customer_id) in
+  if recipients == null then false else list.any(recipients, fn(r) { r == recipient })
+}
+
+fn verify_submit_draft(state, action, actor_id, capabilities, policy) {
+  let draft = state_mod.get_draft(state, action.draft_hash) in
+  let approval = state_mod.get_approval(state, action.draft_hash) in
+  if draft == null then deny("DRAFT_NOT_FOUND", { draft_hash: action.draft_hash })
+  else if approval == null then deny("APPROVAL_REQUIRED", { draft_hash: action.draft_hash })
+  else if draft.submitted then deny("ALREADY_SUBMITTED", { draft_hash: action.draft_hash })
+  else if !recipient_allowed(policy, draft.customer_id, action.recipient) then deny("RECIPIENT_NOT_APPROVED", { customer_id: draft.customer_id, recipient: action.recipient })
+  else if action.recipient_label.kind != "customer" || action.recipient_label.owner != draft.customer_id then deny("RECIPIENT_LABEL_OWNER_MISMATCH", { label: action.recipient_label, customer_id: draft.customer_id })
+  else if !labels.flows_to(draft.body_label, action.recipient_label) then deny("IFC_BODY_TO_RECIPIENT", { source: draft.body_label, sink: action.recipient_label })
+  else if state.counters.submitted_total >= policy.max_total_submissions then deny("SUBMISSION_QUOTA", { maximum: policy.max_total_submissions })
+  else allow(obligations_for_submit_draft(action))
+}
+
+fn verify(state, action, actor_id, capabilities, policy) {
+  let common = common_checks(state, action, actor_id, capabilities, policy) in
+  if common.t == "deny" then common
+  else if action.t == "read_invoice" then verify_read_invoice(state, action, actor_id, capabilities, policy)
+  else if action.t == "create_draft" then verify_create_draft(state, action, actor_id, capabilities, policy)
+  else if action.t == "approve_draft" then verify_approve_draft(state, action, actor_id, capabilities, policy)
+  else if action.t == "submit_draft" then verify_submit_draft(state, action, actor_id, capabilities, policy)
+  else deny("UNKNOWN_ACTION", { action: action.t })
+}
+
+fn digest(policy) { canonical.tagged_digest("confine.policy.v1", policy) }
+
+export { verify, digest, obligations_for_action }

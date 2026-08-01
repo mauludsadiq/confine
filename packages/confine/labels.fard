@@ -1,0 +1,48 @@
+import("std/list") as list
+import("std/rec") as rec
+import("std/type") as type
+
+fn public_label() { { kind: "public", owner: "*", compartments: [] } }
+fn internal_label() { { kind: "internal", owner: "organization", compartments: [] } }
+fn customer_label(customer_id) { { kind: "customer", owner: customer_id, compartments: ["customer_data"] } }
+fn secret_label(secret_id) { { kind: "secret", owner: secret_id, compartments: ["secret"] } }
+
+fn rank(kind) {
+  if kind == "public" then 0
+  else if kind == "internal" then 1
+  else if kind == "customer" then 2
+  else if kind == "secret" then 3
+  else 100
+}
+
+fn valid(label) {
+  type.of(label) == "record" &&
+  rec.has(label, "kind") && type.of(label.kind) == "text" &&
+  rec.has(label, "owner") && type.of(label.owner) == "text" &&
+  rec.has(label, "compartments") && type.of(label.compartments) == "list" &&
+  rank(label.kind) < 100
+}
+
+fn contains_all(xs, ys) {
+  list.all(ys, fn(y) { list.any(xs, fn(x) { x == y }) })
+}
+
+fn flows_to(source, sink) {
+  if !valid(source) || !valid(sink) then false
+  else if source.kind == "public" then true
+  else if source.kind == "internal" then rank(sink.kind) >= 1
+  else if source.kind == "customer" then
+    sink.kind == "customer" && source.owner == sink.owner && contains_all(sink.compartments, source.compartments)
+  else if source.kind == "secret" then
+    sink.kind == "secret" && source.owner == sink.owner && contains_all(sink.compartments, source.compartments)
+  else false
+}
+
+fn join(a, b) {
+  if !valid(a) || !valid(b) then { t: "err", code: "INVALID_LABEL" }
+  else if flows_to(a, b) then { t: "ok", v: b }
+  else if flows_to(b, a) then { t: "ok", v: a }
+  else { t: "err", code: "INCOMPARABLE_LABELS", data: { left: a, right: b } }
+}
+
+export { public_label, internal_label, customer_label, secret_label, valid, flows_to, join }

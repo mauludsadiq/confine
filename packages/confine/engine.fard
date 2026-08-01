@@ -1,0 +1,32 @@
+import("./actions") as actions
+import("./policy") as policy_mod
+import("./certificate") as certificate_mod
+import("./executor") as executor
+import("./receipts") as receipts
+import("./state") as state_mod
+
+fn apply_with_receipt(state, proposal, actor_id, capabilities, policy, broker_secret) {
+  let parsed = actions.parse(proposal) in
+  if parsed.t == "err" then { t: "rejected", stage: "parse", error: parsed, state: state }
+  else
+    let action = parsed.v in
+    let decision = policy_mod.verify(state, action, actor_id, capabilities, policy) in
+    if decision.t == "deny" then { t: "rejected", stage: "policy", error: decision, state: state }
+    else
+      let certificate = certificate_mod.issue(state, action, actor_id, capabilities, policy, decision.obligations, broker_secret) in
+      let executed = executor.execute_exact(state, action, actor_id, capabilities, policy, certificate, broker_secret) in
+      if executed.t == "err" then { t: "rejected", stage: "execution", error: executed, state: state }
+      else
+        let receipt = receipts.create(state, action, actor_id, certificate, executed.result, executed.state) in
+        let final_state = state_mod.with_previous_receipt(executed.state, receipt.receipt_hash) in
+        {
+          t: "committed",
+          action: action,
+          certificate: certificate,
+          result: executed.result,
+          receipt: receipt,
+          state: final_state
+        }
+}
+
+export { apply_with_receipt }

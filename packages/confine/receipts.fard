@@ -1,0 +1,67 @@
+import("std/rec") as rec
+import("std/list") as list
+import("./canonical") as canonical
+import("./actions") as actions
+import("./state") as state_mod
+import("./certificate") as certificate_mod
+
+fn payload(prior_state, action, actor_id, certificate, result, resulting_state) {
+  {
+    version: 1,
+    previous_receipt_hash: prior_state.previous_receipt_hash,
+    prior_state_hash: state_mod.hash_state(prior_state),
+    action_hash: actions.action_hash(action),
+    actor_id: actor_id,
+    certificate_hash: certificate_mod.digest(certificate),
+    result_hash: canonical.tagged_digest("confine.result.v1", result),
+    resulting_state_hash: state_mod.hash_state(resulting_state),
+    nonce: action.nonce,
+    sequence_before: prior_state.sequence,
+    sequence_after: resulting_state.sequence
+  }
+}
+
+fn create(prior_state, action, actor_id, certificate, result, resulting_state) {
+  let p = payload(prior_state, action, actor_id, certificate, result, resulting_state) in
+  let receipt_hash = canonical.tagged_digest("confine.receipt.v1", p) in
+  { t: "transition_receipt", payload: p, receipt_hash: receipt_hash }
+}
+
+fn verify(receipt) {
+  if !rec.has(receipt, "payload") || !rec.has(receipt, "receipt_hash") then { t: "err", code: "MALFORMED_RECEIPT" }
+  else
+    let expected = canonical.tagged_digest("confine.receipt.v1", receipt.payload) in
+    if expected != receipt.receipt_hash then { t: "err", code: "RECEIPT_HASH_MISMATCH", data: { expected: expected, actual: receipt.receipt_hash } }
+    else if receipt.payload.sequence_after != receipt.payload.sequence_before + 1 then { t: "err", code: "RECEIPT_SEQUENCE_INVALID" }
+    else { t: "ok", v: receipt }
+}
+
+fn verify_chain_from(receipts, index) {
+  if index >= list.len(receipts) then { t: "ok", v: true }
+  else
+    let current = list.get(receipts, index) in
+    let verified = verify(current) in
+    if verified.t == "err" then verified
+    else if index == 0 then verify_chain_from(receipts, index + 1)
+    else
+      let previous = list.get(receipts, index - 1) in
+      if current.payload.previous_receipt_hash != previous.receipt_hash then { t: "err", code: "BROKEN_RECEIPT_CHAIN", data: { index: index } }
+      else if current.payload.prior_state_hash != previous.payload.resulting_state_hash then { t: "err", code: "BROKEN_STATE_CHAIN", data: { index: index } }
+      else if current.payload.sequence_before != previous.payload.sequence_after then { t: "err", code: "BROKEN_SEQUENCE_CHAIN", data: { index: index } }
+      else verify_chain_from(receipts, index + 1)
+}
+
+fn verify_unique_nonces_from(receipts, index, seen) {
+  if index >= list.len(receipts) then { t: "ok", v: true }
+  else
+    let n = list.get(receipts, index).payload.nonce in
+    if rec.has(seen, n) then { t: "err", code: "DUPLICATE_NONCE", data: { nonce: n, index: index } }
+    else verify_unique_nonces_from(receipts, index + 1, rec.set(seen, n, true))
+}
+
+fn verify_chain(receipts) {
+  let chain = verify_chain_from(receipts, 0) in
+  if chain.t == "err" then chain else verify_unique_nonces_from(receipts, 0, {})
+}
+
+export { create, verify, verify_chain }

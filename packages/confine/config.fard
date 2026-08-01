@@ -1,0 +1,40 @@
+import("std/type") as type
+import("std/rec") as rec
+import("std/list") as list
+import("std/str") as str
+import("./labels") as labels
+import("./capabilities") as capabilities_mod
+
+fn validate_policy(policy) {
+  if type.of(policy) != "record" then { t: "err", code: "POLICY_NOT_RECORD" }
+  else if !rec.has(policy, "version") || type.of(policy.version) != "text" then { t: "err", code: "POLICY_VERSION_REQUIRED" }
+  else if !rec.has(policy, "min_nonce_length") || type.of(policy.min_nonce_length) != "int" || policy.min_nonce_length < 1 then { t: "err", code: "BAD_MIN_NONCE_LENGTH" }
+  else if !rec.has(policy, "max_draft_chars") || type.of(policy.max_draft_chars) != "int" || policy.max_draft_chars < 1 then { t: "err", code: "BAD_MAX_DRAFT_CHARS" }
+  else if !rec.has(policy, "max_total_drafts") || type.of(policy.max_total_drafts) != "int" || policy.max_total_drafts < 1 then { t: "err", code: "BAD_MAX_TOTAL_DRAFTS" }
+  else if !rec.has(policy, "max_total_submissions") || type.of(policy.max_total_submissions) != "int" || policy.max_total_submissions < 1 then { t: "err", code: "BAD_MAX_TOTAL_SUBMISSIONS" }
+  else if !rec.has(policy, "approver_role") || type.of(policy.approver_role) != "text" then { t: "err", code: "APPROVER_ROLE_REQUIRED" }
+  else if !rec.has(policy, "require_separation_of_duties") || type.of(policy.require_separation_of_duties) != "bool" then { t: "err", code: "SEPARATION_POLICY_REQUIRED" }
+  else if !rec.has(policy, "approved_recipients") || type.of(policy.approved_recipients) != "record" then { t: "err", code: "APPROVED_RECIPIENTS_REQUIRED" }
+  else { t: "ok", v: policy }
+}
+
+fn validate_data(config) {
+  if !rec.has(config, "invoices") || type.of(config.invoices) != "record" then { t: "err", code: "INVOICES_REQUIRED" }
+  else if !rec.has(config, "threads") || type.of(config.threads) != "record" then { t: "err", code: "THREADS_REQUIRED" }
+  else { t: "ok", v: config }
+}
+
+fn validate(config) {
+  if type.of(config) != "record" then { t: "err", code: "CONFIG_NOT_RECORD" }
+  else if !rec.has(config, "policy") then { t: "err", code: "POLICY_REQUIRED" }
+  else if !rec.has(config, "capabilities") then { t: "err", code: "CAPABILITIES_REQUIRED" }
+  else if !rec.has(config, "broker_secret") || type.of(config.broker_secret) != "text" || str.len(config.broker_secret) < 32 then { t: "err", code: "BROKER_SECRET_TOO_SHORT" }
+  else
+    let pv = validate_policy(config.policy) in
+    if pv.t == "err" then pv else
+    let cv = capabilities_mod.validate(config.capabilities) in
+    if cv.t == "err" then cv else
+    validate_data(config)
+}
+
+export { validate }

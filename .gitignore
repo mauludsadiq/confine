@@ -1,0 +1,6 @@
+out/
+receipts/
+test_output.json
+*.bak
+*.bak2
+*.bak3

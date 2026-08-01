@@ -1,0 +1,33 @@
+import("std/rec") as rec
+import("std/list") as list
+import("std/type") as type
+import("./canonical") as canonical
+
+fn initial(config) {
+  {
+    policy_version: config.policy_version,
+    sequence: 0,
+    invoices: config.invoices,
+    threads: config.threads,
+    drafts: {},
+    approvals: {},
+    submissions: [],
+    consumed_nonces: {},
+    counters: { submitted_total: 0, drafted_total: 0, approved_total: 0 },
+    previous_receipt_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
+
+fn hash_state(state) { canonical.tagged_digest("confine.state.v1", rec.remove(state, "previous_receipt_hash")) }
+fn nonce_consumed(state, nonce) { rec.has(state.consumed_nonces, nonce) }
+fn consume_nonce_map(state, nonce) { rec.set(state.consumed_nonces, nonce, true) }
+fn get_invoice(state, invoice_id) { rec.get(state.invoices, invoice_id) }
+fn get_thread(state, thread_id) { rec.get(state.threads, thread_id) }
+fn get_draft(state, draft_hash) { rec.get(state.drafts, draft_hash) }
+fn get_approval(state, draft_hash) { rec.get(state.approvals, draft_hash) }
+
+fn with_previous_receipt(state, receipt_hash) {
+  { ...state, previous_receipt_hash: receipt_hash }
+}
+
+export { initial, hash_state, nonce_consumed, consume_nonce_map, get_invoice, get_thread, get_draft, get_approval, with_previous_receipt }

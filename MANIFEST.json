@@ -1,0 +1,26 @@
+{
+  "name": "confine",
+  "version": "1.0.0",
+  "language": "FARD",
+  "dialect": "v1.7.1",
+  "entry": "examples/run_invoice.fard",
+  "tests": [
+    "tests/test_confine.fard"
+  ],
+  "modules": [
+    "examples/invoice_config.fard",
+    "examples/run_invoice.fard",
+    "packages/confine/actions.fard",
+    "packages/confine/canonical.fard",
+    "packages/confine/capabilities.fard",
+    "packages/confine/certificate.fard",
+    "packages/confine/config.fard",
+    "packages/confine/engine.fard",
+    "packages/confine/executor.fard",
+    "packages/confine/labels.fard",
+    "packages/confine/policy.fard",
+    "packages/confine/receipts.fard",
+    "packages/confine/state.fard",
+    "tests/test_confine.fard"
+  ]
+}
