@@ -9,6 +9,7 @@ import("../packages/confine/certificate") as certificate_mod
 import("../packages/confine/executor") as executor
 import("../packages/confine/policy") as policy_mod
 import("../packages/confine/commit_store") as commit_store
+import("../packages/confine/canonical") as canonical
 
 fn cfg() { invoice_config.build("0123456789abcdef0123456789abcdef") }
 
@@ -440,4 +441,259 @@ test "commit_store atomically rejects one of two racing commits against the same
   let a_won = result_a.t == "committed" && result_b.t == "conflict" && result_b.code == "STATE_COMMIT_CONFLICT" in
   let b_won = result_b.t == "committed" && result_a.t == "conflict" && result_a.code == "STATE_COMMIT_CONFLICT" in
   a_won || b_won
+}
+
+test "post_to_slack denies customer-labelled draft flowing to internal channel" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-slack-0001", labels.customer_label("cust_001"), "drafter_1") in
+  let a = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-slack-0002",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  let r = engine.apply_with_receipt(a.state, {
+    t: "post_to_slack",
+    draft_hash: d.result.draft_hash,
+    channel_id: "channel-finance",
+    channel_label: labels.internal_label(),
+    nonce: "nonce-slack-0003",
+    expected_state_hash: state_mod.hash_state(a.state)
+  }, "poster_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "IFC_BODY_TO_CHANNEL"
+}
+
+test "post_to_slack denies actor without post_to_slack capability" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let dummy_hash = canonical.tagged_digest("confine.draft.v1", { placeholder: true }) in
+  let r = engine.apply_with_receipt(s0, {
+    t: "post_to_slack",
+    draft_hash: dummy_hash,
+    channel_id: "channel-finance",
+    channel_label: labels.internal_label(),
+    nonce: "nonce-slack-0004",
+    expected_state_hash: state_mod.hash_state(s0)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "CAPABILITY_DENIED"
+}
+
+test "post_to_slack succeeds for internal-labelled draft to configured channel" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let draft_content = { thread_id: "thread_001", invoice_id: "inv_001", customer_id: "cust_001", body: "Internal ops note about inv_001.", body_label: labels.internal_label(), created_by: "drafter_1" } in
+  let draft_hash = canonical.tagged_digest("confine.draft.v1", draft_content) in
+  let draft = { ...draft_content, draft_hash: draft_hash, deliveries: { email: { submitted: false, recipient: null }, slack: {} } } in
+  let approval = { draft_hash: draft_hash, approver_id: "approver_1", sequence: s0.sequence } in
+  let s1 = { ...s0, drafts: rec.set(s0.drafts, draft_hash, draft), approvals: rec.set(s0.approvals, draft_hash, approval) } in
+  let r = engine.apply_with_receipt(s1, {
+    t: "post_to_slack",
+    draft_hash: draft_hash,
+    channel_id: "channel-finance",
+    channel_label: labels.internal_label(),
+    nonce: "nonce-slack-0005",
+    expected_state_hash: state_mod.hash_state(s1)
+  }, "poster_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "committed" && r.result.effect.t == "slack_message" && r.result.effect.channel_id == "channel-finance"
+}
+
+test "email and slack quotas are enforced independently" {
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+
+  // Sub-case A: email quota exhausted, slack still allowed.
+  let d1 = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-slack-0006", labels.customer_label("cust_001"), "drafter_1") in
+  let a1 = engine.apply_with_receipt(d1.state, {
+    t: "approve_draft",
+    draft_hash: d1.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-slack-0007",
+    expected_state_hash: state_mod.hash_state(d1.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  let exhausted_email_state = { ...a1.state, counters: { ...a1.state.counters, submitted_total: c.policy.max_total_submissions } } in
+  let email_denied = engine.apply_with_receipt(exhausted_email_state, {
+    t: "submit_draft",
+    draft_hash: d1.result.draft_hash,
+    recipient: "billing@example.test",
+    recipient_label: labels.customer_label("cust_001"),
+    nonce: "nonce-slack-0008",
+    expected_state_hash: state_mod.hash_state(exhausted_email_state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+
+  let internal_draft_content_a = { thread_id: "thread_001", invoice_id: "inv_001", customer_id: "cust_001", body: "Internal note A.", body_label: labels.internal_label(), created_by: "drafter_1" } in
+  let internal_draft_hash_a = canonical.tagged_digest("confine.draft.v1", internal_draft_content_a) in
+  let internal_draft_a = { ...internal_draft_content_a, draft_hash: internal_draft_hash_a, deliveries: { email: { submitted: false, recipient: null }, slack: {} } } in
+  let internal_approval_a = { draft_hash: internal_draft_hash_a, approver_id: "approver_1", sequence: exhausted_email_state.sequence } in
+  let state_with_internal_a = { ...exhausted_email_state, drafts: rec.set(exhausted_email_state.drafts, internal_draft_hash_a, internal_draft_a), approvals: rec.set(exhausted_email_state.approvals, internal_draft_hash_a, internal_approval_a) } in
+  let slack_allowed = engine.apply_with_receipt(state_with_internal_a, {
+    t: "post_to_slack",
+    draft_hash: internal_draft_hash_a,
+    channel_id: "channel-finance",
+    channel_label: labels.internal_label(),
+    nonce: "nonce-slack-0009",
+    expected_state_hash: state_mod.hash_state(state_with_internal_a)
+  }, "poster_1", c.capabilities, c.policy, c.broker_secret) in
+
+  // Sub-case B: slack quota exhausted, email still allowed.
+  let d2 = create_draft(s0, "cust_002", "inv_002", "thread_002", "nonce-slack-0010", labels.customer_label("cust_002"), "drafter_1") in
+  let a2 = engine.apply_with_receipt(d2.state, {
+    t: "approve_draft",
+    draft_hash: d2.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-slack-0011",
+    expected_state_hash: state_mod.hash_state(d2.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  let exhausted_slack_state = { ...a2.state, counters: { ...a2.state.counters, slack_posted_total: c.policy.max_total_slack_posts } } in
+
+  let internal_draft_content_b = { thread_id: "thread_002", invoice_id: "inv_002", customer_id: "cust_002", body: "Internal note B.", body_label: labels.internal_label(), created_by: "drafter_1" } in
+  let internal_draft_hash_b = canonical.tagged_digest("confine.draft.v1", internal_draft_content_b) in
+  let internal_draft_b = { ...internal_draft_content_b, draft_hash: internal_draft_hash_b, deliveries: { email: { submitted: false, recipient: null }, slack: {} } } in
+  let internal_approval_b = { draft_hash: internal_draft_hash_b, approver_id: "approver_1", sequence: exhausted_slack_state.sequence } in
+  let state_with_internal_b = { ...exhausted_slack_state, drafts: rec.set(exhausted_slack_state.drafts, internal_draft_hash_b, internal_draft_b), approvals: rec.set(exhausted_slack_state.approvals, internal_draft_hash_b, internal_approval_b) } in
+  let slack_denied = engine.apply_with_receipt(state_with_internal_b, {
+    t: "post_to_slack",
+    draft_hash: internal_draft_hash_b,
+    channel_id: "channel-finance",
+    channel_label: labels.internal_label(),
+    nonce: "nonce-slack-0012",
+    expected_state_hash: state_mod.hash_state(state_with_internal_b)
+  }, "poster_1", c.capabilities, c.policy, c.broker_secret) in
+  let email_allowed = engine.apply_with_receipt(exhausted_slack_state, {
+    t: "submit_draft",
+    draft_hash: d2.result.draft_hash,
+    recipient: "accounts@example.test",
+    recipient_label: labels.customer_label("cust_002"),
+    nonce: "nonce-slack-0013",
+    expected_state_hash: state_mod.hash_state(exhausted_slack_state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+
+  email_denied.t == "rejected" && email_denied.error.code == "SUBMISSION_QUOTA" &&
+  slack_allowed.t == "committed" &&
+  slack_denied.t == "rejected" && slack_denied.error.code == "SLACK_QUOTA" &&
+  email_allowed.t == "committed"
+}
+
+test "email submission and slack posting update state independently with no cross-contamination" {
+  // A customer-labelled draft cannot legally reach an internal Slack
+  // channel under the current IFC lattice (customer only flows to
+  // customer), so the same draft cannot be legitimately delivered through
+  // both adapters -- that is itself a correct invariant of the label
+  // system, not a limitation of this test. Independence is instead proven
+  // across two separately eligible drafts within the same state lineage:
+  // submitting one via email must not affect the other's Slack eligibility
+  // or shared counters beyond its own counter, and vice versa.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+
+  let d_email = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-slack-0014", labels.customer_label("cust_001"), "drafter_1") in
+  let a_email = engine.apply_with_receipt(d_email.state, {
+    t: "approve_draft",
+    draft_hash: d_email.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-slack-0015",
+    expected_state_hash: state_mod.hash_state(d_email.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  let email_result = engine.apply_with_receipt(a_email.state, {
+    t: "submit_draft",
+    draft_hash: d_email.result.draft_hash,
+    recipient: "billing@example.test",
+    recipient_label: labels.customer_label("cust_001"),
+    nonce: "nonce-slack-0016",
+    expected_state_hash: state_mod.hash_state(a_email.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+
+  let internal_draft_content = { thread_id: "thread_001", invoice_id: "inv_001", customer_id: "cust_001", body: "Internal note C.", body_label: labels.internal_label(), created_by: "drafter_1" } in
+  let internal_draft_hash = canonical.tagged_digest("confine.draft.v1", internal_draft_content) in
+  let internal_draft = { ...internal_draft_content, draft_hash: internal_draft_hash, deliveries: { email: { submitted: false, recipient: null }, slack: {} } } in
+  let internal_approval = { draft_hash: internal_draft_hash, approver_id: "approver_1", sequence: email_result.state.sequence } in
+  let state_with_internal = { ...email_result.state, drafts: rec.set(email_result.state.drafts, internal_draft_hash, internal_draft), approvals: rec.set(email_result.state.approvals, internal_draft_hash, internal_approval) } in
+
+  let slack_result = engine.apply_with_receipt(state_with_internal, {
+    t: "post_to_slack",
+    draft_hash: internal_draft_hash,
+    channel_id: "channel-finance",
+    channel_label: labels.internal_label(),
+    nonce: "nonce-slack-0017",
+    expected_state_hash: state_mod.hash_state(state_with_internal)
+  }, "poster_1", c.capabilities, c.policy, c.broker_secret) in
+
+  let final_email_draft = rec.get(slack_result.state.drafts, d_email.result.draft_hash) in
+  let final_internal_draft = rec.get(slack_result.state.drafts, internal_draft_hash) in
+
+  email_result.t == "committed" &&
+  slack_result.t == "committed" &&
+  slack_result.state.counters.submitted_total == 1 &&
+  slack_result.state.counters.slack_posted_total == 1 &&
+  final_email_draft.deliveries.email.submitted == true &&
+  rec.has(final_email_draft.deliveries.slack, "channel-finance") == false &&
+  rec.has(final_internal_draft.deliveries.slack, "channel-finance") == true &&
+  final_internal_draft.deliveries.email.submitted == false
+}
+
+test "executor independently rejects policy-invalid post_to_slack certificate" {
+  // Generalization proof for the item-5 fix: a certificate is issued
+  // directly (bypassing policy.verify()) for a post_to_slack action that
+  // violates IFC (customer draft to internal channel), with obligations
+  // internally consistent with the forged action. The executor's rerun
+  // of the full policy kernel must catch this exactly as it does for
+  // create_draft and submit_draft, with zero new code specific to Slack.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-slack-0018", labels.customer_label("cust_001"), "drafter_1") in
+  let a = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-slack-0019",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+
+  let invalid_action = {
+    t: "post_to_slack",
+    draft_hash: d.result.draft_hash,
+    channel_id: "channel-finance",
+    channel_label: labels.internal_label(),
+    nonce: "nonce-slack-0020",
+    expected_state_hash: state_mod.hash_state(a.state)
+  } in
+  let obligations = [
+    { t: "post_exact_hash", draft_hash: invalid_action.draft_hash },
+    { t: "channel", channel_id: invalid_action.channel_id }
+  ] in
+  let certificate = certificate_mod.issue(
+    a.state, invalid_action, "poster_1", c.capabilities, c.policy, obligations, c.broker_secret
+  ) in
+  let executed = executor.execute_exact(
+    a.state, invalid_action, "poster_1", c.capabilities, c.policy, certificate, c.broker_secret
+  ) in
+  executed.t == "err" && executed.code == "EXECUTOR_POLICY_DENIED" && executed.policy_code == "IFC_BODY_TO_CHANNEL"
+}
+
+test "post_to_slack rejects forged channel_label that does not match configured channel" {
+  // Channel identity and channel classification must be bound together
+  // by policy, not supplied independently by the caller. Even though the
+  // claimed label here would, on its own, be a legal source of customer
+  // data, it does not match what "channel-finance" is actually configured
+  // as (internal), so it must be rejected regardless of IFC compatibility.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-slack-0021", labels.customer_label("cust_001"), "drafter_1") in
+  let a = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-slack-0022",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+  let r = engine.apply_with_receipt(a.state, {
+    t: "post_to_slack",
+    draft_hash: d.result.draft_hash,
+    channel_id: "channel-finance",
+    channel_label: labels.customer_label("cust_001"),
+    nonce: "nonce-slack-0023",
+    expected_state_hash: state_mod.hash_state(a.state)
+  }, "poster_1", c.capabilities, c.policy, c.broker_secret) in
+  r.t == "rejected" && r.error.code == "CHANNEL_LABEL_MISMATCH"
 }

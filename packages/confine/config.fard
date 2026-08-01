@@ -15,6 +15,8 @@ fn validate_policy(policy) {
   else if !rec.has(policy, "approver_role") || type.of(policy.approver_role) != "text" then { t: "err", code: "APPROVER_ROLE_REQUIRED" }
   else if !rec.has(policy, "require_separation_of_duties") || type.of(policy.require_separation_of_duties) != "bool" then { t: "err", code: "SEPARATION_POLICY_REQUIRED" }
   else if !rec.has(policy, "approved_recipients") || type.of(policy.approved_recipients) != "record" then { t: "err", code: "APPROVED_RECIPIENTS_REQUIRED" }
+  else if !rec.has(policy, "approved_slack_channels") || type.of(policy.approved_slack_channels) != "record" then { t: "err", code: "APPROVED_SLACK_CHANNELS_REQUIRED" }
+  else if !rec.has(policy, "max_total_slack_posts") || type.of(policy.max_total_slack_posts) != "int" || policy.max_total_slack_posts < 1 then { t: "err", code: "BAD_MAX_TOTAL_SLACK_POSTS" }
   else { t: "ok", v: policy }
 }
 

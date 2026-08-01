@@ -68,6 +68,22 @@ fn parse_submit_draft(r) {
   else { t: "ok", v: { t: "submit_draft", draft_hash: draft_hash.v, recipient: recipient.v, recipient_label: r.recipient_label, nonce: nonce.v, expected_state_hash: state_hash.v } }
 }
 
+fn parse_post_to_slack(r) {
+  let fields = canonical.no_unknown_fields(r, ["t", "draft_hash", "channel_id", "channel_label", "nonce", "expected_state_hash"]) in
+  if fields.t == "err" then fields else
+  let draft_hash = canonical.require_text_field(r, "draft_hash", "BAD_POST_TO_SLACK") in
+  if draft_hash.t == "err" then draft_hash else
+  let channel_id = canonical.require_text_field(r, "channel_id", "BAD_POST_TO_SLACK") in
+  if channel_id.t == "err" then channel_id else
+  let nonce = canonical.require_text_field(r, "nonce", "BAD_POST_TO_SLACK") in
+  if nonce.t == "err" then nonce else
+  let state_hash = canonical.require_text_field(r, "expected_state_hash", "BAD_POST_TO_SLACK") in
+  if state_hash.t == "err" then state_hash else
+  if !rec.has(r, "channel_label") || !labels.valid(r.channel_label) then { t: "err", code: "BAD_CHANNEL_LABEL" }
+  else if !canonical.valid_sha256(draft_hash.v) || !canonical.valid_sha256(state_hash.v) then { t: "err", code: "BAD_HASH" }
+  else { t: "ok", v: { t: "post_to_slack", draft_hash: draft_hash.v, channel_id: channel_id.v, channel_label: r.channel_label, nonce: nonce.v, expected_state_hash: state_hash.v } }
+}
+
 fn parse(proposal) {
   if type.of(proposal) != "record" then { t: "err", code: "PROPOSAL_NOT_RECORD" }
   else if !rec.has(proposal, "t") || type.of(proposal.t) != "text" then { t: "err", code: "MISSING_ACTION_TAG" }
@@ -75,6 +91,7 @@ fn parse(proposal) {
   else if proposal.t == "create_draft" then parse_create_draft(proposal)
   else if proposal.t == "approve_draft" then parse_approve_draft(proposal)
   else if proposal.t == "submit_draft" then parse_submit_draft(proposal)
+  else if proposal.t == "post_to_slack" then parse_post_to_slack(proposal)
   else { t: "err", code: "UNKNOWN_ACTION", data: { action: proposal.t } }
 }
 

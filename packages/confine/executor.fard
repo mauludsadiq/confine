@@ -6,13 +6,10 @@ import("./state") as state_mod
 import("./certificate") as certificate_mod
 import("./policy") as policy_mod
 
-// TRUST BOUNDARY NOTE: execute_exact() is the final authority boundary.
-// It independently verifies the certificate's MAC/hashes AND independently
-// recomputes the expected obligations for the action via
-// policy_mod.obligations_for_action(), rejecting if the certificate's
-// obligations don't match exactly. This means execute_exact() does not
-// rely on the caller (engine.apply_with_receipt or any future adapter)
-// having derived obligations correctly at issuance time.
+// TRUST BOUNDARY: execute_exact() independently reruns the FULL policy
+// kernel (policy_mod.verify) rather than re-deriving obligations alone.
+// A certificate cannot authorize an action the policy kernel itself would
+// reject, regardless of who issued it or what obligations it claims.
 
 fn execute_read_invoice(state, action, actor_id) {
   let invoice = state_mod.get_invoice(state, action.invoice_id) in
@@ -27,7 +24,7 @@ fn execute_read_invoice(state, action, actor_id) {
 fn execute_create_draft(state, action, actor_id) {
   let draft_content = { thread_id: action.thread_id, invoice_id: action.invoice_id, customer_id: action.customer_id, body: action.body, body_label: action.body_label, created_by: actor_id } in
   let draft_hash = canonical.tagged_digest("confine.draft.v1", draft_content) in
-  let draft = { ...draft_content, draft_hash: draft_hash, submitted: false } in
+  let draft = { ...draft_content, draft_hash: draft_hash, deliveries: { email: { submitted: false, recipient: null }, slack: {} } } in
   let next = {
     ...state,
     sequence: state.sequence + 1,
@@ -52,7 +49,7 @@ fn execute_approve_draft(state, action, actor_id) {
 
 fn execute_submit_draft(state, action, actor_id) {
   let draft = state_mod.get_draft(state, action.draft_hash) in
-  let submitted_draft = { ...draft, submitted: true, submitted_to: action.recipient } in
+  let submitted_draft = { ...draft, deliveries: { ...draft.deliveries, email: { submitted: true, recipient: action.recipient } } } in
   let external_effect = {
     t: "email_submission",
     recipient: action.recipient,
@@ -73,17 +70,28 @@ fn execute_submit_draft(state, action, actor_id) {
   { t: "ok", result: { t: "draft_submitted", effect: external_effect }, state: next }
 }
 
-// TRUST BOUNDARY: execute_exact() independently reruns the FULL policy
-// kernel (policy_mod.verify) rather than re-deriving obligations alone.
-// This subsumes the obligation-match check (decision.obligations IS
-// obligations_for_action(state, action) whenever decision.t == "allow")
-// and additionally re-verifies every other policy invariant -- IFC label
-// flow, label ownership, capability grants, quotas, approval state,
-// recipient allow-lists, etc. -- against the exact state and action being
-// executed, rather than trusting that certificate.issue()'s caller ran
-// policy.verify() correctly (or at all) before requesting a certificate.
-// A certificate cannot authorize an action the policy kernel itself would
-// reject, regardless of who issued it or what obligations it claims.
+fn execute_post_to_slack(state, action, actor_id) {
+  let draft = state_mod.get_draft(state, action.draft_hash) in
+  let updated_draft = { ...draft, deliveries: { ...draft.deliveries, slack: rec.set(draft.deliveries.slack, action.channel_id, true) } } in
+  let external_effect = {
+    t: "slack_message",
+    channel_id: action.channel_id,
+    channel_label: action.channel_label,
+    body: draft.body,
+    body_hash: canonical.tagged_digest("confine.body.v1", draft.body),
+    draft_hash: action.draft_hash
+  } in
+  let next = {
+    ...state,
+    sequence: state.sequence + 1,
+    drafts: rec.set(state.drafts, action.draft_hash, updated_draft),
+    slack_posts: list.append(state.slack_posts, external_effect),
+    consumed_nonces: state_mod.consume_nonce_map(state, action.nonce),
+    counters: { ...state.counters, slack_posted_total: state.counters.slack_posted_total + 1 }
+  } in
+  { t: "ok", result: { t: "slack_posted", effect: external_effect }, state: next }
+}
+
 fn execute_exact(state, action, actor_id, capabilities, policy, certificate, broker_secret) {
   let cv = certificate_mod.verify(certificate, state, action, actor_id, capabilities, policy, broker_secret) in
   if cv.t == "err" then cv
@@ -96,6 +104,7 @@ fn execute_exact(state, action, actor_id, capabilities, policy, certificate, bro
     else if action.t == "create_draft" then execute_create_draft(state, action, actor_id)
     else if action.t == "approve_draft" then execute_approve_draft(state, action, actor_id)
     else if action.t == "submit_draft" then execute_submit_draft(state, action, actor_id)
+    else if action.t == "post_to_slack" then execute_post_to_slack(state, action, actor_id)
     else { t: "err", code: "EXECUTOR_UNKNOWN_ACTION" }
 }
 

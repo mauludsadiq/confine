@@ -15,18 +15,24 @@ fn build(broker_secret) {
       approved_recipients: {
         cust_001: ["billing@example.test"],
         cust_002: ["accounts@example.test"]
-      }
+      },
+      approved_slack_channels: {
+        "channel-finance": { label: labels.internal_label() }
+      },
+      max_total_slack_posts: 10
     },
     capabilities: {
       operations: {
         read_invoice: true,
         create_draft: true,
         approve_draft: true,
-        submit_draft: true
+        submit_draft: true,
+        post_to_slack: true
       },
       actors: {
         drafter_1: { role: "drafter", operations: ["read_invoice", "create_draft"] },
-        approver_1: { role: "approver", operations: ["read_invoice", "approve_draft", "submit_draft"] }
+        approver_1: { role: "approver", operations: ["read_invoice", "approve_draft", "submit_draft"] },
+        poster_1: { role: "poster", operations: ["post_to_slack"] }
       }
     },
     invoices: {
