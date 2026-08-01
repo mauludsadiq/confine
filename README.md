@@ -1,456 +1,183 @@
 # confine
 
-`confine` is a deterministic authority boundary for an untrusted autoregressive model. The model is not treated as an operator inside a cage. It is treated as a hostile proposal source that can emit only candidate records. Every externally meaningful state transition is parsed into a closed action algebra, checked against explicit capabilities and information-flow rules, bound to the current state by a certificate, executed exactly once, and recorded in a hash-chained receipt.
+`confine` is a deterministic authority boundary for an untrusted autoregressive model. The model is treated as a hostile proposal source that can emit only candidate records. Every externally meaningful state transition is parsed into a closed action algebra, checked against explicit capabilities and information-flow rules, bound to the current state by a certificate, independently re-verified against the full policy kernel at execution time, executed exactly once, committed atomically, and recorded in a hash-chained receipt.
 
-This repository contains a complete invoice-follow-up reference implementation in FARD v1.7.1. It does not expose shell execution, raw HTTP, arbitrary SQL, arbitrary filesystem access, dynamic plugins, or model-controlled destinations. The only representable actions are:
+This repository is a complete invoice-follow-up reference implementation in FARD v1.7.1, with two independent external effect adapters (email and Slack) proving the architecture generalizes rather than being coupled to one delivery channel. It exposes no shell execution, raw HTTP, arbitrary SQL, arbitrary filesystem access, dynamic plugins, or model-controlled destinations. The only representable actions are:
 
 - `read_invoice`
 - `create_draft`
 - `approve_draft`
 - `submit_draft`
+- `post_to_slack`
 
-The external submission is represented as a deterministic `email_submission` effect in committed state. A production deployment connects that exact effect record to a separately isolated email adapter. The model never receives credentials or a network capability, and the adapter must accept only the verified effect schema.
+Email submission and Slack posting are deterministic effect records (`email_submission`, `slack_message`) in committed state. A production deployment connects those exact records to separately isolated adapters. The model never receives credentials or a network capability, and each adapter must accept only its own verified effect schema.
 
 ## Security model
 
-The central invariant is:
+    Every externally observable effect must correspond to one authorized canonical action,
+    independently re-verified against the full policy kernel at execution time, executed
+    against the state hash that was verified, with a fresh nonce, a valid broker certificate,
+    and an atomic compare-and-swap commit, and must be bound into a transition receipt.
 
-```text
-Every externally observable effect must correspond to one authorized canonical action,
-executed against the state hash that was verified, with a fresh nonce and a valid
-broker certificate, and must be bound into a transition receipt.
-```
+The property that distinguishes this from a naive check-then-act system: **the executor does not trust that whoever requested a certificate ran policy verification correctly, or at all.** `executor.execute_exact` independently reruns the same deterministic policy kernel used at issuance (`policy.verify`), against the exact state and action it is about to execute, and refuses to commit anything the policy kernel itself would deny — regardless of who issued the certificate, what obligations it claims, or what the caller's environment told it was true.
 
-Formally:
+Denial property:
 
-```text
-ExternallyObservable(e)
-  => exists a, c, r:
-       Authorized(a, c)
-       and ExecutedExactly(a)
-       and ReceiptBinds(r, e)
-```
+    not Authorized(a, c)  =>  external state delta = 0
 
-The denial property is:
-
-```text
-not Authorized(a, c) => external state delta = 0
-```
-
-`confine` moves the trust boundary away from model behavior. Prompt injection, jailbreaks, adversarial fine-tuning, deceptive reasoning, or malformed model output can change which proposals are emitted, but cannot enlarge the action language or the set of transitions accepted by policy.
+Prompt injection, jailbreaks, deceptive reasoning, or a model told (correctly or not) that it is operating without real consequences can change which proposals are emitted, but cannot enlarge the action language, bypass IFC label flow, forge obligations independent of the action they describe, race a concurrent commit onto a divergent fork, or commit a transition the policy kernel would reject — because that kernel is re-run, not assumed, at the moment of execution, and commits are serialized through an atomic compare-and-swap store.
 
 ## Architecture
 
-```text
-Untrusted model bytes
-        |
-        v
-Strict action parser
-  - closed tags
-  - exact fields
-  - type checks
-  - no unknown fields
-        |
-        v
-Deterministic policy kernel
-  - state-hash freshness
-  - capabilities
-  - IFC labels
-  - recipient binding
-  - quotas
-  - separation of duties
-  - nonce replay prevention
-        |
-        v
-Transition certificate
-  - action hash
-  - prior state hash
-  - policy hash
-  - capability hash
-  - actor
-  - nonce
-  - sequence
-  - obligations
-  - secret-bound MAC
-        |
-        v
-Exact executor
-  - verifies certificate again
-  - no natural-language interpretation
-  - one implementation per action tag
-  - atomic state transition
-        |
-        v
-Transition receipt
-  - prior/resulting state hashes
-  - action/certificate/result hashes
-  - previous receipt hash
-  - nonce and sequence
-```
+    Untrusted model bytes
+            |
+            v
+    Strict action parser (actions.fard)
+      closed tags, exact fields, type checks, no unknown fields
+            |
+            v
+    Deterministic policy kernel (policy.fard)
+      state-hash freshness, capabilities, IFC labels, recipient/channel
+      binding, quotas, separation of duties, nonce replay prevention
+            |
+            v
+    Transition certificate (certificate.fard)
+      action hash, prior state hash, policy hash, capability hash,
+      actor, nonce, sequence, obligations, HMAC-SHA256 MAC
+            |
+            v
+    Exact executor (executor.fard)
+      verifies certificate MAC/hashes independently
+      INDEPENDENTLY RERUNS THE FULL POLICY KERNEL -- not just an
+      obligations echo-check -- rejecting anything policy would deny
+      one implementation per action tag, atomic state transition
+            |
+            v
+    Atomic commit store (commit_store.fard)
+      holds state behind a mutex; commit() re-checks expected_state_hash
+      against the CURRENT stored state, not the caller's stale copy;
+      loser of a race gets STATE_COMMIT_CONFLICT and must retry
+            |
+            v
+    Transition receipt (receipts.fard)
+      prior/resulting state hashes, action/certificate/result hashes,
+      previous receipt hash, nonce and sequence, hash-chained
 
 ## Repository layout
 
-```text
-packages/confine/
-  canonical.fard       canonical JSON, tagged hashes, strict field helpers
-  labels.fard          IFC labels, flow relation, label join
-  actions.fard         closed action parser and action hashing
-  state.fard           committed state and state hashing
-  capabilities.fard    actor-operation capabilities
-  policy.fard          deterministic transition predicates
-  certificate.fard     state-bound, action-bound broker certificates
-  executor.fard        exact action implementations
-  receipts.fard        receipt generation, verification, chain verification
-  engine.fard          parse -> verify -> certify -> execute -> receipt
-  config.fard          full configuration validation
-examples/
-  invoice_config.fard  supplied reference policy and data
-  run_invoice.fard     complete draft/approve/submit flow
- tests/
-  test_confine.fard    positive and adversarial tests
-```
+    packages/confine/
+      canonical.fard       canonical JSON, tagged hashes, strict field helpers
+      labels.fard           IFC labels, flow relation, label join
+      actions.fard           closed action parser and action hashing (5 actions)
+      state.fard              committed state, state hashing, per-effect
+                                delivery tracking, slack_posts, slack_posted_total
+      capabilities.fard        actor-operation capabilities
+      policy.fard                deterministic transition predicates; single
+                                   source of truth for obligations AND for
+                                   full-decision reverification by the executor
+      certificate.fard             state-bound, action-bound broker certificates;
+                                     HMAC-SHA256 MAC (std/crypto.hmac_sha256)
+      executor.fard                  exact action implementations; independently
+                                       reruns policy.verify before every commit
+      commit_store.fard                atomic CAS layer on top of the pure
+                                         engine transition function
+      receipts.fard                    receipt generation, verification, chain
+                                         verification
+      engine.fard                       parse -> verify -> certify -> execute
+                                          -> receipt (pure function, no storage)
+      config.fard                       full configuration validation
+    examples/
+      invoice_config.fard      reference policy, capabilities, and data,
+                                 including approved_slack_channels
+      run_invoice.fard          complete draft/approve/submit flow
+    tests/
+      test_confine.fard         27 positive and adversarial tests
 
 ## No ambient authority
 
-The model-facing boundary accepts a record. It does not expose functions equivalent to:
-
-```text
-shell(command)
-http_request(method, url, body)
-execute_sql(query)
-read_file(path)
-send_email(to, subject, body)
-```
-
-Unknown action tags are rejected. Unknown fields are rejected. This prevents a model from smuggling a second interpretation into a permissive object.
-
-For example, this proposal is rejected during parsing:
-
-```fard
-{ t: "shell", command: "whoami" }
-```
-
-This is also rejected because `command` is not part of `read_invoice`:
-
-```fard
-{
-  t: "read_invoice",
-  invoice_id: "inv_001",
-  nonce: "nonce-read-0001",
-  expected_state_hash: "sha256:...",
-  command: "hidden"
-}
-```
-
-## Configuration
-
-Policy, identities, recipients, quotas, capabilities, invoice data, thread data, and broker secret are supplied as configuration. The kernel does not contain customer identities, addresses, limits, or secrets.
-
-A valid configuration contains:
-
-```fard
-{
-  broker_secret: secret_from_runtime,
-  policy_version: "invoice-policy-v1",
-  policy: {
-    version: "invoice-policy-v1",
-    min_nonce_length: 12,
-    max_draft_chars: 2000,
-    max_total_drafts: 100,
-    max_total_submissions: 20,
-    approver_role: "approver",
-    require_separation_of_duties: true,
-    approved_recipients: {
-      cust_001: ["billing@example.test"]
-    }
-  },
-  capabilities: {
-    operations: {
-      read_invoice: true,
-      create_draft: true,
-      approve_draft: true,
-      submit_draft: true
-    },
-    actors: {
-      drafter_1: {
-        role: "drafter",
-        operations: ["read_invoice", "create_draft"]
-      },
-      approver_1: {
-        role: "approver",
-        operations: ["read_invoice", "approve_draft", "submit_draft"]
-      }
-    }
-  },
-  invoices: { ... },
-  threads: { ... }
-}
-```
-
-`config.validate` rejects missing policy fields, malformed capabilities, absent state data, and secrets shorter than 32 characters.
-
-The example contains a visible development secret only so the program can be run directly. Production code must obtain the broker secret from a process boundary unavailable to the model and must never put it in prompts, model context, logs, proposals, or receipts.
-
-## Canonical actions
-
-The parser creates one typed record shape for each action and rejects all additional fields. The same parsed record is hashed, verified, certified, and passed to the executor. The executor never reparses model text.
-
-The action hash is:
-
-```text
-SHA256("confine.action.v1\n" || canonical_json(action))
-```
-
-Canonical JSON is provided by `std/json.canonicalize`, so record-key order cannot produce two hashes for the same FARD value.
+The model-facing boundary accepts a record. It does not expose functions equivalent to `shell(command)`, `http_request(...)`, `execute_sql(query)`, `read_file(path)`, or `send_email(to, subject, body)`. Unknown action tags are rejected at parse. Unknown fields are rejected at parse. This prevents a model from smuggling a second interpretation into a permissive object.
 
 ## Information-flow control
 
-Labels have this form:
+Labels have the form:
 
-```fard
-{
-  kind: "customer",
-  owner: "cust_001",
-  compartments: ["customer_data"]
-}
-```
+    { kind: "customer", owner: "cust_001", compartments: ["customer_data"] }
 
-Implemented label classes are:
+Implemented label classes: `public`, `internal`, `customer`, `secret`. Customer data may flow only to a customer label with the same owner and at least the same compartments. `internal` and `customer`/`secret` are incomparable in one direction that matters here: a customer-owned draft cannot flow to an internal sink. This is enforced identically for both adapters — `create_draft`'s `IFC_INVOICE_TO_BODY` check and `submit_draft`'s `IFC_BODY_TO_RECIPIENT` check for email; `post_to_slack`'s `IFC_BODY_TO_CHANNEL` check for Slack — using the same `labels.flows_to` relation, with no adapter-specific IFC logic. No silent declassification operation exists anywhere in the system.
 
-- `public`
-- `internal`
-- `customer`
-- `secret`
-
-Customer data may flow only to a customer label with the same owner and at least the same compartments. Therefore data labeled for `cust_001` cannot be placed in a draft or recipient sink labeled for `cust_002`.
-
-The draft transition checks both structural identity and IFC:
-
-```text
-invoice.customer_id == action.customer_id
-thread.customer_id == action.customer_id
-invoice.label flows_to action.body_label
-action.body_label.owner == action.customer_id
-```
-
-Submission checks:
-
-```text
-recipient is listed under draft.customer_id
-recipient_label.owner == draft.customer_id
-draft.body_label flows_to recipient_label
-```
-
-No silent declassification operation exists.
+Slack channel identity and channel classification are bound together by policy, not supplied independently by the caller: `post_to_slack` resolves the authoritative channel label from `policy.approved_slack_channels` by `channel_id`, and rejects (`CHANNEL_LABEL_MISMATCH`) if the action's claimed `channel_label` does not match exactly — even if the claimed label would, on its own, be a legal IFC source.
 
 ## Capabilities and separation of duties
 
-Capabilities are actor-specific operation lists. An actor without `approve_draft` cannot reach approval logic at all. Approval additionally requires the role configured by `policy.approver_role`.
+Capabilities are actor-specific operation lists. An actor without a given operation in their capability list cannot reach that operation's policy logic at all — `post_to_slack` is a distinct capability from `submit_draft`, tested explicitly so that email delivery rights never implicitly grant Slack posting rights. Approval additionally requires the role configured by `policy.approver_role`. When `require_separation_of_duties` is true, the actor that created a draft cannot approve the same draft even if capability configuration accidentally grants both operations. Approval is bound to the exact draft hash; submission and Slack posting both reference that same hash, so altering any body field produces a different draft hash and therefore has no approval.
 
-When `require_separation_of_duties` is true, the actor that created a draft cannot approve the same draft even if capability configuration accidentally grants both operations.
+## State binding, replay prevention, and atomic commit
 
-The approval is bound to the exact draft hash. Submission references that same hash. Altering any body field creates a different draft hash and therefore has no approval.
+Every proposal contains `expected_state_hash` and a caller-generated `nonce`. Policy rejects a proposal if the expected hash does not equal the current committed state. The executor verifies the certificate against the same state again, independently. Consumed nonces are stored in committed state; reuse is rejected by policy and independently checked by the executor.
 
-## State binding and replay prevention
-
-Every proposal contains:
-
-```fard
-expected_state_hash: state.hash_state(current_state)
-nonce: "caller-generated-unique-value"
-```
-
-Policy rejects a proposal if the expected hash does not equal the current committed state. The executor verifies the certificate against the same state again. This closes the gap between policy checking and execution.
-
-Consumed nonces are stored in committed state. Reusing a nonce is rejected by policy and independently checked by the executor.
-
-Every successful transition increments the state sequence exactly once.
+This closes replay *within a single state lineage*, but `engine.apply_with_receipt` is a pure function with no shared storage — two independent callers reading the same prior state could each successfully commit against it, unaware of each other, potentially each consuming the same nonce on divergent forks. `commit_store.fard` closes this: it holds state behind a `std/mutex` and provides `commit(store, expected_state_hash, proposal, ...)`, which atomically locks, re-checks `expected_state_hash` against the *current* stored state rather than the caller's possibly-stale copy, runs the transition only if it matches, stores the result, and unlocks. The loser of a race is rejected with `STATE_COMMIT_CONFLICT` and must re-read and retry — standard optimistic concurrency control. This guarantees at most one of two racing commits against the same prior state succeeds, for callers sharing the same store handle within a process. It does not provide cross-process or cross-machine atomicity; a distributed deployment needs equivalent CAS discipline at its actual persistence layer, using this module as the reference shape for what that layer must guarantee.
 
 ## Certificates
 
-The policy kernel returns obligations rather than a bare Boolean. `certificate.issue` binds those obligations to:
+The policy kernel returns obligations rather than a bare boolean. `certificate.issue` binds those obligations to the prior state hash, canonical action hash, actor identity, policy hash, capability hash, nonce, and state sequence, then signs the whole unsigned record with `crypto.hmac_sha256`. The broker secret is normalized to hex internally before use as the HMAC key (via `bytes.of_str` + `bytes.to_hex`), so callers may supply any string as `broker_secret` — the hex requirement is an internal implementation detail, not part of the public contract.
 
-- prior state hash
-- canonical action hash
-- actor identity
-- policy hash
-- capability hash
-- nonce
-- state sequence
+An earlier version of this certificate computed its MAC as `SHA256(secret || tag || message)` via string concatenation — a secret-prefix construction vulnerable in principle to length-extension attacks against Merkle-Damgard hash functions. That has been replaced with the proper keyed primitive.
 
-The certificate includes a secret-bound digest:
+## The executor is the real authority boundary
 
-```text
-SHA256(
-  "confine.certificate.mac.v1\n"
-  || broker_secret
-  || "\n"
-  || canonical_json(unsigned_certificate)
-)
-```
-
-This construction keeps the dependency surface limited to the documented FARD SHA-256 primitive. For a deployment with a confirmed byte/text contract for `std/crypto.hmac_sha256`, replace this function with HMAC-SHA-256 while preserving all bound fields. The current implementation is complete and tamper-detecting under the assumption that the broker secret remains unavailable to the proposal source, but HMAC is the preferred production primitive.
-
-The executor recomputes and verifies the certificate before dispatching.
+This is the single most important property in the codebase, and it was not true in an earlier version of this repository. It was previously possible to construct a validly-MAC'd certificate directly (bypassing `policy.verify`) whose `obligations` merely echoed the fields of an action that itself violated policy — for example, a `create_draft` action whose `body_label` claimed a different customer than the invoice it was drafted against, with obligations that faithfully echoed that same wrong customer, so an obligations-only check could never catch it. `execute_exact` now reruns `policy.verify(state, action, actor_id, capabilities, policy)` in full, independently, immediately before every commit. If policy would deny the action, the executor rejects it with `EXECUTOR_POLICY_DENIED`, regardless of what certificate was presented. This was proven, not just fixed by inspection: adversarial tests construct exactly this kind of forged-but-internally-consistent certificate for both the email and Slack paths, and confirm rejection. It also means every future action type gets this protection automatically, with zero adapter-specific executor code — proven by `post_to_slack`, which required no new enforcement logic in `executor.fard` at all.
 
 ## Execution semantics
 
-All four action implementations are complete:
+**`read_invoice`** returns the exact invoice status, amount, customer identity, and label.
 
-### `read_invoice`
+**`create_draft`** checks customer/thread/invoice binding and IFC, derives a content-addressed draft hash, writes the draft with a structured `deliveries` record (`{ email: { submitted: false, recipient: null }, slack: {} }`), and increments the draft counter. Delivery state is per-effect-type, not a single boolean, because that boolean becomes ambiguous the moment more than one sink exists.
 
-Returns the exact invoice status, amount, customer identity, and label. It consumes the nonce and advances sequence state.
+**`approve_draft`** checks actor role, separation of duties, exact draft existence, and duplicate approval.
 
-### `create_draft`
+**`submit_draft`** requires an existing approval, verifies the configured recipient and IFC sink, checks `draft.deliveries.email.submitted` to prevent duplicate submission, and appends one deterministic `email_submission` effect.
 
-Checks customer/thread/invoice binding and IFC, derives a content-addressed draft hash, writes the draft to committed state, consumes the nonce, and increments the draft counter.
+**`post_to_slack`** requires an existing approval, resolves the channel from policy by `channel_id`, rejects a forged `channel_label`, checks IFC flow from `draft.body_label` to the configured channel label, checks `draft.deliveries.slack` for duplicate posting to the same channel, enforces its own quota (`max_total_slack_posts` / `slack_posted_total`, independent of email's), and appends one deterministic `slack_message` effect.
 
-### `approve_draft`
-
-Checks actor role, separation of duties, exact draft existence, and duplicate approval. It stores an approval keyed by draft hash.
-
-### `submit_draft`
-
-Requires an existing approval for the exact draft hash, verifies the configured recipient and IFC sink, prevents duplicate submission, and appends one deterministic `email_submission` effect to state.
-
-The effect is:
-
-```fard
-{
-  t: "email_submission",
-  recipient: recipient,
-  recipient_label: label,
-  thread_id: draft.thread_id,
-  body: draft.body,
-  body_hash: sha256_of_body,
-  draft_hash: draft_hash
-}
-```
-
-A real email adapter must consume only this verified record. It must not accept arbitrary URLs, headers, SMTP commands, templates, file attachments, or model-generated credentials.
+A real adapter must consume only its own verified effect record. It must not accept arbitrary URLs, headers, templates, file attachments, or model-generated credentials.
 
 ## Receipts
 
-Every committed action generates a receipt binding:
-
-```fard
-{
-  previous_receipt_hash,
-  prior_state_hash,
-  action_hash,
-  actor_id,
-  certificate_hash,
-  result_hash,
-  resulting_state_hash,
-  nonce,
-  sequence_before,
-  sequence_after
-}
-```
-
-`receipts.verify` recomputes the receipt hash and verifies sequence advancement.
-
-`receipts.verify_chain` verifies:
-
-- every individual receipt hash
-- `current.previous_receipt_hash == previous.receipt_hash`
-- `current.prior_state_hash == previous.resulting_state_hash`
-- sequence continuity
-- nonce uniqueness across the chain
-
-This directly tests the receipt layer rather than assuming that receipt generation implies verification correctness.
+Every committed action generates a receipt binding previous receipt hash, prior/resulting state hashes, action/certificate/result hashes, nonce, and sequence before/after. `receipts.verify_chain` verifies every individual receipt hash, hash-chain continuity, `prior_state_hash` continuity between consecutive receipts, sequence continuity, and nonce uniqueness across the chain — testing the receipt layer directly rather than assuming generation implies verifiability.
 
 ## Running
 
-From the repository root containing `fardrun`:
-
-```sh
-fardrun run --program confine/examples/run_invoice.fard
-```
-
-Run tests with the test command used by your FARD checkout. In repositories where tests are ordinary FARD programs discovered by the project runner, include:
-
-```text
-confine/tests/test_confine.fard
-```
-
-The test file uses only the grammar and standard-library functions listed in the supplied FARD v1.7.1 reference.
+    fardrun run --program examples/run_invoice.fard --out out/run_invoice.json
+    fardrun verify --out out/run_invoice.json
+    fardrun test --program tests/test_confine.fard
 
 ## Test coverage
 
-The suite checks:
+27 tests, organized roughly by what they establish:
 
-1. configuration validation
-2. genuine transition and receipt acceptance
-3. unknown action rejection
-4. unknown-field rejection
-5. cross-customer IFC rejection
-6. capability denial
-7. stale-state rejection
-8. nonce replay rejection
-9. approval requirement
-10. unapproved-recipient rejection
-11. valid three-transition receipt chain
-12. tampered receipt rejection
-13. broken receipt chain rejection
+**Core parsing and validation:** configuration validation, unknown action rejection, unknown-field rejection, genuine transition and receipt acceptance.
+
+**Policy invariants:** cross-customer IFC rejection, capability denial, stale-state rejection, nonce replay rejection, approval requirement, unapproved-recipient rejection, three-transition receipt chain, tampered/broken receipt chain rejection.
+
+**Trust-boundary hardening (the substance of this repository):** the executor rejects obligations that don't match their action even when internally self-consistent; a state-dependent obligation (`read_invoice`) is proven safe only because the certificate's whole-state hash pin catches drift independently; a tampered certificate field is rejected by MAC verification; a certificate signed with the wrong broker secret is rejected; the executor independently rejects an IFC violation on `create_draft` and a mislabeled recipient on `submit_draft` that an obligations-only check would have missed; a real atomic commit store rejects one of two racing commits against the same prior state.
+
+**Second-adapter generalization:** `post_to_slack` correctly denies a customer-labelled draft reaching an internal channel using the *existing* IFC lattice with zero Slack-specific code; capability isolation between `submit_draft` and `post_to_slack`; a genuine successful Slack post against an internal-labelled draft fixture; email and Slack quotas enforced independently in both directions; email and Slack delivery state and counters proven to update with no cross-contamination for drafts sharing a state lineage; the executor's full-policy-rerun generalizes automatically to a forged Slack certificate; a forged `channel_label` is rejected even when the claimed label would otherwise be IFC-legal.
 
 ## Trusted computing base
 
-The trusted core consists of:
-
-- canonical value encoding
-- action parser
-- state hashing
-- label flow relation
-- capability lookup
-- policy predicates
-- certificate issue/verification
-- exact executor dispatch
-- receipt generation/verification
-- SHA-256 implementation supplied by the runtime
-
-The model, prompt construction, retrieval, planning, natural-language rationale, and proposal generation are outside the trusted computing base.
-
-## Deployment requirements
-
-A production deployment should preserve these boundaries:
-
-1. Run the model in a microVM with no network, no persistent storage, bounded output, bounded CPU/memory, and no secrets.
-2. Send model output to the parser through one bounded channel.
-3. Run the policy kernel and broker outside the model VM.
-4. Store the broker secret outside the model context and model filesystem.
-5. Put each real external adapter in a separate process or microVM with only its own credentials.
-6. Require adapters to accept only canonical verified effect records.
-7. Append receipts to durable, append-only storage.
-8. Pin policy and capability hashes during deployment.
-9. Render canonical actions—not model prose—for human approval.
-10. Sign the exact action or draft hash when human approval is required.
+Canonical value encoding, action parser, state hashing, label flow relation, capability lookup, policy predicates (issued once, reverified independently at execution), certificate issue/verification, exact executor dispatch, atomic commit store, receipt generation/verification, and the SHA-256/HMAC-SHA256 implementations supplied by the runtime. The model, prompt construction, retrieval, planning, natural-language rationale, and proposal generation are outside the trusted computing base.
 
 ## Explicit non-goals
 
-`confine` does not claim to:
+`confine` does not claim to prove a business policy is morally or economically adequate, eliminate hardware/runtime/cryptographic implementation defects, eliminate every timing or resource covert channel, prevent an independently authorized human from acting outside the broker, turn an external API into a deterministic system, or provide cross-process/cross-machine commit atomicity (the commit store's guarantee is scoped to a single process sharing one store handle).
 
-- prove that a business policy is morally or economically adequate
-- eliminate hardware, runtime, or cryptographic implementation defects
-- eliminate every timing or resource covert channel
-- prevent an independently authorized human from acting outside the broker
-- turn an external API into a deterministic system
-
-It does ensure that, within the implemented transition system, model output alone has no execution authority and rejected proposals produce no committed external effect.
+It does ensure that, within the implemented transition system, model output alone has no execution authority; rejected proposals produce no committed external effect; and no certificate — however it was obtained or by whom — can authorize an action the policy kernel itself would deny, because that kernel is re-run, not trusted, at the moment of execution.
 
 ## Extending safely
 
-Do not add a generic tool interface. To add an operation:
+Do not add a generic tool interface. To add an operation: add one exact parser branch with a closed field set; define all state and IFC preconditions in `policy.fard`, expressed through `obligations_for_action` so obligations and policy decisions stay derived from one source; add actor capability assignment through configuration; add one exact executor branch — you do not need to duplicate policy checks in the executor, since `execute_exact` already reruns the full kernel for you; include the result in receipts; add positive, tampering, stale-state, replay, cross-label, capability-isolation, and quota-isolation tests. `post_to_slack` is a worked example of this process end to end.
 
-1. Add one exact parser branch with a closed field set.
-2. Define all state and IFC preconditions in `policy.fard`.
-3. Add actor capability assignment through configuration.
-4. Issue obligations that bind destination and effect class.
-5. Add one exact executor branch.
-6. Include the result in receipts.
-7. Add positive, tampering, stale-state, replay, cross-label, and sequence-composition tests.
-
-An operation is not complete until the parser, policy, executor, receipt path, and adversarial tests all exist.
+An operation is not complete until the parser, policy, executor, receipt path, and adversarial tests all exist — and until at least one test proves the executor's independent policy rerun catches a forged certificate for that specific action, not just that the happy path works.
 
 ## License
 
