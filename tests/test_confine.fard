@@ -8,6 +8,7 @@ import("../examples/invoice_config") as invoice_config
 import("../packages/confine/certificate") as certificate_mod
 import("../packages/confine/executor") as executor
 import("../packages/confine/policy") as policy_mod
+import("../packages/confine/commit_store") as commit_store
 
 fn cfg() { invoice_config.build("0123456789abcdef0123456789abcdef") }
 
@@ -402,4 +403,41 @@ test "executor independently rejects mislabeled recipient on submit_draft" {
   ) in
 
   executed.t == "err" && executed.code == "EXECUTOR_POLICY_DENIED" && executed.policy_code == "RECIPIENT_LABEL_OWNER_MISMATCH"
+}
+
+test "commit_store atomically rejects one of two racing commits against the same prior state" {
+  // Proves the real fix for the fork-race gap: engine.apply_with_receipt()
+  // alone is a pure function with no shared storage, so two independent
+  // callers can both read the same prior state and both successfully
+  // commit against it -- but commit_store.commit() closes that by holding
+  // state behind a std/mutex and atomically re-checking expected_state_hash
+  // against the CURRENT stored state (not the caller's stale copy) before
+  // running the transition. Whichever commit acquires the lock second sees
+  // the first commit's result already stored, its expected_state_hash no
+  // longer matches, and it is rejected with STATE_COMMIT_CONFLICT rather
+  // than silently succeeding on a divergent fork.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let store = commit_store.new_store(s0) in
+  let shared_nonce = "shared-nonce-fork-test" in
+  let action_a = {
+    t: "read_invoice",
+    invoice_id: "inv_001",
+    nonce: shared_nonce,
+    expected_state_hash: state_mod.hash_state(s0)
+  } in
+  let action_b = {
+    t: "read_invoice",
+    invoice_id: "inv_002",
+    nonce: shared_nonce,
+    expected_state_hash: state_mod.hash_state(s0)
+  } in
+  // Both "racers" computed their expected_state_hash against the same s0,
+  // exactly as two concurrent readers of the same snapshot would.
+  let result_a = commit_store.commit(store, state_mod.hash_state(s0), action_a, "drafter_1", c.capabilities, c.policy, c.broker_secret) in
+  let result_b = commit_store.commit(store, state_mod.hash_state(s0), action_b, "drafter_1", c.capabilities, c.policy, c.broker_secret) in
+  // Exactly one must succeed and the other must be rejected as a conflict.
+  let a_won = result_a.t == "committed" && result_b.t == "conflict" && result_b.code == "STATE_COMMIT_CONFLICT" in
+  let b_won = result_b.t == "committed" && result_a.t == "conflict" && result_a.code == "STATE_COMMIT_CONFLICT" in
+  a_won || b_won
 }

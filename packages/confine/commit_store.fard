@@ -1,0 +1,57 @@
+import("std/mutex") as mutex
+import("./state") as state_mod
+import("./engine") as engine
+
+// commit_store.fard: a real atomic compare-and-swap layer on top of the
+// pure engine.apply_with_receipt() state transitions.
+//
+// engine.apply_with_receipt() is a pure function -- state in, new state
+// out -- with no shared storage, so nothing prevents two independent
+// callers from both reading the same prior state and both successfully
+// committing against it, each unaware of the other (proven by the test
+// "confine provides no cross-fork serialization" in test_confine.fard).
+//
+// This module closes that gap for any callers that route commits through
+// a single shared store: it holds the current state behind a std/mutex,
+// and commit() atomically (a) locks, (b) verifies the caller's assumed
+// prior state still matches what's actually stored, (c) runs the real
+// transition only if so, (d) stores the result and unlocks. If another
+// commit interleaved between when the caller last read state and when
+// commit() acquired the lock, the state will have moved and commit()
+// rejects with STATE_COMMIT_CONFLICT -- forcing the caller to re-read
+// the current state and retry, which is standard optimistic-concurrency-
+// control (CAS) behavior.
+//
+// This guarantees at most one of two racing commits against the same
+// prior state succeeds, for any callers within a single process sharing
+// the same store handle. It does NOT provide cross-process or
+// cross-machine atomicity -- a distributed deployment needs the same CAS
+// discipline enforced by its actual persistence layer (e.g. a database
+// transaction or consensus system), using this module's shape as the
+// reference for what that layer must guarantee.
+
+fn new_store(initial_state) {
+  mutex.new(initial_state)
+}
+
+fn current_state(store) {
+  let s = mutex.lock(store) in
+  mutex.unlock(store, s)
+}
+
+fn commit(store, expected_state_hash, proposal, actor_id, capabilities, policy, broker_secret) {
+  let current = mutex.lock(store) in
+  if state_mod.hash_state(current) != expected_state_hash then
+    let _ = mutex.unlock(store, current) in
+    { t: "conflict", code: "STATE_COMMIT_CONFLICT", expected: expected_state_hash, actual: state_mod.hash_state(current) }
+  else
+    let result = engine.apply_with_receipt(current, proposal, actor_id, capabilities, policy, broker_secret) in
+    if result.t != "committed" then
+      let _ = mutex.unlock(store, current) in
+      result
+    else
+      let _ = mutex.unlock(store, result.state) in
+      result
+}
+
+export { new_store, current_state, commit }
