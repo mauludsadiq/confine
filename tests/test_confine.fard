@@ -317,3 +317,89 @@ test "certificate signed with wrong broker secret is rejected" {
 
   executed.t == "err" && executed.code == "CERTIFICATE_MAC_MISMATCH"
 }
+
+test "executor independently rejects IFC violation on create_draft" {
+  // Regression test for a real trust-boundary bug: execute_exact() now
+  // reruns policy_mod.verify() in full at execution time, not just the
+  // obligation-match check. This certificate is issued directly (bypassing
+  // policy.verify()) for a create_draft action whose body_label belongs to
+  // a DIFFERENT customer than the invoice it's drafted against -- a real
+  // cross-customer data leak. The obligations are internally consistent
+  // with the forged action (both claim cust_999), so the obligation-match
+  // check alone would NOT catch this -- only independently re-running the
+  // full policy kernel (which recomputes labels.flows_to against the real
+  // invoice in state) catches it.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+
+  let leaking_action = {
+    t: "create_draft",
+    thread_id: "thread_001",
+    invoice_id: "inv_001",
+    customer_id: "cust_001",
+    body: "Invoice inv_001 remains overdue. Please review the outstanding balance.",
+    body_label: labels.customer_label("cust_999"),
+    nonce: "nonce-test-0050",
+    expected_state_hash: state_mod.hash_state(s0)
+  } in
+
+  let obligations = [
+    { t: "bind_customer", customer_id: leaking_action.customer_id },
+    { t: "body_label", label: leaking_action.body_label }
+  ] in
+
+  let certificate = certificate_mod.issue(
+    s0, leaking_action, "drafter_1", c.capabilities, c.policy, obligations, c.broker_secret
+  ) in
+
+  let executed = executor.execute_exact(
+    s0, leaking_action, "drafter_1", c.capabilities, c.policy, certificate, c.broker_secret
+  ) in
+
+  executed.t == "err" && executed.code == "EXECUTOR_POLICY_DENIED" && executed.policy_code == "IFC_INVOICE_TO_BODY"
+}
+
+test "executor independently rejects mislabeled recipient on submit_draft" {
+  // Symmetric coverage for the actual declassification boundary: submit_draft
+  // is where data flows from an internal draft to an external recipient.
+  // Crafts a certificate directly for a submit_draft action whose
+  // recipient_label.owner does not match the draft's true customer_id, with
+  // obligations that are internally consistent with the forged action (so
+  // the obligation-match check alone would not catch it). Only the
+  // independent full policy rerun -- which re-checks RECIPIENT_LABEL_OWNER_MISMATCH
+  // against the real draft in state -- catches it.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let d = create_draft(s0, "cust_001", "inv_001", "thread_001", "nonce-test-0051", labels.customer_label("cust_001"), "drafter_1") in
+  let a = engine.apply_with_receipt(d.state, {
+    t: "approve_draft",
+    draft_hash: d.result.draft_hash,
+    approver_id: "approver_1",
+    nonce: "nonce-test-0052",
+    expected_state_hash: state_mod.hash_state(d.state)
+  }, "approver_1", c.capabilities, c.policy, c.broker_secret) in
+
+  let mislabeled_action = {
+    t: "submit_draft",
+    draft_hash: d.result.draft_hash,
+    recipient: "billing@example.test",
+    recipient_label: labels.customer_label("cust_999"),
+    nonce: "nonce-test-0053",
+    expected_state_hash: state_mod.hash_state(a.state)
+  } in
+
+  let obligations = [
+    { t: "submit_exact_hash", draft_hash: mislabeled_action.draft_hash },
+    { t: "recipient", recipient: mislabeled_action.recipient }
+  ] in
+
+  let certificate = certificate_mod.issue(
+    a.state, mislabeled_action, "approver_1", c.capabilities, c.policy, obligations, c.broker_secret
+  ) in
+
+  let executed = executor.execute_exact(
+    a.state, mislabeled_action, "approver_1", c.capabilities, c.policy, certificate, c.broker_secret
+  ) in
+
+  executed.t == "err" && executed.code == "EXECUTOR_POLICY_DENIED" && executed.policy_code == "RECIPIENT_LABEL_OWNER_MISMATCH"
+}

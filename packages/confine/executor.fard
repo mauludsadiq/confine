@@ -73,16 +73,30 @@ fn execute_submit_draft(state, action, actor_id) {
   { t: "ok", result: { t: "draft_submitted", effect: external_effect }, state: next }
 }
 
+// TRUST BOUNDARY: execute_exact() independently reruns the FULL policy
+// kernel (policy_mod.verify) rather than re-deriving obligations alone.
+// This subsumes the obligation-match check (decision.obligations IS
+// obligations_for_action(state, action) whenever decision.t == "allow")
+// and additionally re-verifies every other policy invariant -- IFC label
+// flow, label ownership, capability grants, quotas, approval state,
+// recipient allow-lists, etc. -- against the exact state and action being
+// executed, rather than trusting that certificate.issue()'s caller ran
+// policy.verify() correctly (or at all) before requesting a certificate.
+// A certificate cannot authorize an action the policy kernel itself would
+// reject, regardless of who issued it or what obligations it claims.
 fn execute_exact(state, action, actor_id, capabilities, policy, certificate, broker_secret) {
   let cv = certificate_mod.verify(certificate, state, action, actor_id, capabilities, policy, broker_secret) in
   if cv.t == "err" then cv
-  else if state_mod.nonce_consumed(state, action.nonce) then { t: "err", code: "NONCE_REPLAY_AT_EXECUTOR" }
-  else if canonical.canonical_text(certificate.obligations) != canonical.canonical_text(policy_mod.obligations_for_action(state, action)) then { t: "err", code: "CERTIFICATE_OBLIGATION_MISMATCH" }
-  else if action.t == "read_invoice" then execute_read_invoice(state, action, actor_id)
-  else if action.t == "create_draft" then execute_create_draft(state, action, actor_id)
-  else if action.t == "approve_draft" then execute_approve_draft(state, action, actor_id)
-  else if action.t == "submit_draft" then execute_submit_draft(state, action, actor_id)
-  else { t: "err", code: "EXECUTOR_UNKNOWN_ACTION" }
+  else
+    let decision = policy_mod.verify(state, action, actor_id, capabilities, policy) in
+    if decision.t == "deny" then { t: "err", code: "EXECUTOR_POLICY_DENIED", policy_code: decision.code, data: decision.data }
+    else if canonical.canonical_text(certificate.obligations) != canonical.canonical_text(decision.obligations) then { t: "err", code: "CERTIFICATE_OBLIGATION_MISMATCH" }
+    else if state_mod.nonce_consumed(state, action.nonce) then { t: "err", code: "NONCE_REPLAY_AT_EXECUTOR" }
+    else if action.t == "read_invoice" then execute_read_invoice(state, action, actor_id)
+    else if action.t == "create_draft" then execute_create_draft(state, action, actor_id)
+    else if action.t == "approve_draft" then execute_approve_draft(state, action, actor_id)
+    else if action.t == "submit_draft" then execute_submit_draft(state, action, actor_id)
+    else { t: "err", code: "EXECUTOR_UNKNOWN_ACTION" }
 }
 
 export { execute_exact }
