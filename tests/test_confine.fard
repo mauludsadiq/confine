@@ -263,3 +263,57 @@ test "read_invoice obligation depends on state; whole-state hash pinning prevent
 
   executed.t == "err" && executed.code == "CERTIFICATE_STATE_MISMATCH"
 }
+
+test "certificate with tampered field is rejected by MAC verification" {
+  // Directly proves the MAC covers the full certificate: flipping any
+  // single field after issuance (without re-signing) must invalidate the
+  // MAC, since verify() recomputes the expected MAC from the actual
+  // certificate contents presented, not from a cached/trusted value.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let action = {
+    t: "read_invoice",
+    invoice_id: "inv_001",
+    nonce: "nonce-test-0040",
+    expected_state_hash: state_mod.hash_state(s0)
+  } in
+  let obligations = policy_mod.obligations_for_action(s0, action) in
+  let certificate = certificate_mod.issue(
+    s0, action, "drafter_1", c.capabilities, c.policy, obligations, c.broker_secret
+  ) in
+
+  // Tamper with actor_id post-issuance without re-signing.
+  let tampered = { ...certificate, actor_id: "attacker" } in
+
+  let executed = executor.execute_exact(
+    s0, action, "attacker", c.capabilities, c.policy, tampered, c.broker_secret
+  ) in
+
+  executed.t == "err" && executed.code == "CERTIFICATE_MAC_MISMATCH"
+}
+
+test "certificate signed with wrong broker secret is rejected" {
+  // Proves the MAC is actually keyed -- a certificate constructed and
+  // "signed" with a different secret than the one execute_exact() is
+  // configured to trust must be rejected, even if every field is otherwise
+  // perfectly well-formed and internally consistent.
+  let c = cfg() in
+  let s0 = state_mod.initial(c) in
+  let action = {
+    t: "read_invoice",
+    invoice_id: "inv_001",
+    nonce: "nonce-test-0041",
+    expected_state_hash: state_mod.hash_state(s0)
+  } in
+  let obligations = policy_mod.obligations_for_action(s0, action) in
+  let wrong_secret = "ffffffffffffffffffffffffffffffff" in
+  let certificate = certificate_mod.issue(
+    s0, action, "drafter_1", c.capabilities, c.policy, obligations, wrong_secret
+  ) in
+
+  let executed = executor.execute_exact(
+    s0, action, "drafter_1", c.capabilities, c.policy, certificate, c.broker_secret
+  ) in
+
+  executed.t == "err" && executed.code == "CERTIFICATE_MAC_MISMATCH"
+}

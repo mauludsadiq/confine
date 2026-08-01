@@ -1,6 +1,8 @@
 import("std/hash") as hash
 import("std/str") as str
 import("std/rec") as rec
+import("std/crypto") as crypto
+import("std/bytes") as bytes
 import("./canonical") as canonical
 import("./actions") as actions
 import("./state") as state_mod
@@ -22,8 +24,28 @@ fn unsigned_certificate(state, action, actor_id, capabilities, policy, obligatio
   }
 }
 
+// TRUST BOUNDARY NOTE: previously this MAC was constructed as
+// SHA256(secret || tag || message) via string concatenation -- a
+// secret-prefix construction that is vulnerable in principle to
+// length-extension attacks against Merkle-Damgard hash functions like
+// SHA-256 (given H(secret||M) and len(secret), an attacker can compute
+// H(secret||M||padding||M') without knowing secret). Practical
+// exploitability was narrow here because verify() separately checks each
+// field against independently recomputed values, but the construction
+// itself was still an anti-pattern resting on incidental JSON-structure
+// protection rather than cryptographic soundness. Fixed to use the
+// stdlib's proper crypto.hmac_sha256(key, msg) primitive instead.
 fn mac(secret, unsigned) {
-  hash.sha256_text(str.concat(["confine.certificate.mac.v1\n", secret, "\n", canonical.canonical_text(unsigned)]))
+  // hmac_sha256 requires its key argument to be a hex string. broker_secret
+  // is an arbitrary caller-supplied string (see examples/run_invoice.fard's
+  // placeholder "replace-at-runtime-with-..." secret), so we normalize it
+  // to hex here rather than pushing a hex-formatting requirement onto every
+  // caller. issue() and verify() both go through this same normalization,
+  // so the derived key stays internally consistent regardless of what form
+  // the original secret was in.
+  let key_hex = bytes.to_hex(bytes.of_str(secret)) in
+  let message = str.concat(["confine.certificate.mac.v1\n", canonical.canonical_text(unsigned)]) in
+  str.concat(["sha256:", crypto.hmac_sha256(key_hex, message)])
 }
 
 fn issue(state, action, actor_id, capabilities, policy, obligations, broker_secret) {
