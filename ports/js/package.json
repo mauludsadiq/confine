@@ -1,0 +1,10 @@
+{
+  "name": "confine-core",
+  "version": "0.1.0",
+  "description": "Canonical encoding, tagged hashing, and HMAC constructions for the confine protocol (spec v2 sections 2-5). Third-language port, mirroring confine-core (Rust) and confine-core-py.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test test/vectors.test.js"
+  }
+}
