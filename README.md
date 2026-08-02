@@ -181,4 +181,4 @@ An operation is not complete until the parser, policy, executor, receipt path, a
 
 ## License
 
-This package is supplied as source for integration into the FARD ecosystem. Add the license appropriate to the containing repository before redistribution.
+MUI
