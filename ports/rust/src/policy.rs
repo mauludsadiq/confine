@@ -75,13 +75,9 @@ fn common_checks(state: &State, action: &Action, actor_id: &str, capabilities: &
     if state.policy_version != policy.version {
         return Some(deny("POLICY_VERSION_MISMATCH"));
     }
-    // NOTE: expected_state_hash comparison against the real hash_state(state)
-    // is not yet wired here since state.rs does not yet port hash_state() --
-    // caller is currently responsible for pre-checking this before calling
-    // verify(), OR this check is added once hash_state() is ported. This is
-    // a known gap, not an oversight: see deny_stale test below, which
-    // exercises this via a direct hash-string mismatch rather than a real
-    // hash_state() call.
+    if action.expected_state_hash() != crate::state::hash_state(state) {
+        return Some(deny("STALE_STATE"));
+    }
     if nonce_consumed(state, action.nonce()) {
         return Some(deny("NONCE_REPLAY"));
     }
@@ -241,6 +237,8 @@ mod tests {
             policy_version: policy.version.clone(), sequence: 0, invoices, threads,
             drafts: BTreeMap::new(), approvals: BTreeMap::new(),
             consumed_nonces: BTreeSet::new(), counters: Counters::default(),
+            submissions: vec![], slack_posts: vec![],
+            previous_receipt_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
         }
     }
 
@@ -256,7 +254,7 @@ mod tests {
             thread_id: "thread_001".into(), invoice_id: "inv_001".into(), customer_id: "cust_001".into(),
             body: "Invoice inv_001 remains overdue. Please review the outstanding balance.".into(),
             body_label: Label::customer("cust_001"),
-            nonce: "nonce-vec-0001".into(), expected_state_hash: "unused-in-this-port".into(),
+            nonce: "nonce-vec-0001".into(), expected_state_hash: crate::state::hash_state(&s0),
         };
         let decision = verify(&s0, &action, "drafter_1", &capabilities, &policy);
         match decision {
@@ -270,6 +268,28 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_deny_stale_state() {
+        let policy = test_policy();
+        let capabilities = test_capabilities();
+        let s0 = initial_state(&policy);
+        let action = Action::ReadInvoice {
+            invoice_id: "inv_001".into(),
+            nonce: "nonce-vec-0006".into(),
+            // Deliberately wrong: a hash that isn't s0's real hash. In the
+            // real captured vector this was expected_state_hash computed
+            // against a DIFFERENT prior state (s1), presented against s1
+            // in fardrun. Here we simplify to any non-matching hash string,
+            // since the point is proving the mismatch check fires at all.
+            expected_state_hash: "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
+        };
+        let decision = verify(&s0, &action, "drafter_1", &capabilities, &policy);
+        match decision {
+            Decision::Deny { code } => assert_eq!(code, "STALE_STATE"),
+            Decision::Allow { .. } => panic!("expected deny"),
+        }
+    }
+
+    #[test]
     fn confirmed_deny_capability() {
         let policy = test_policy();
         let capabilities = test_capabilities();
@@ -277,7 +297,7 @@ mod tests {
         // drafter_1 lacks approve_draft capability
         let action = Action::ApproveDraft {
             draft_hash: "sha256:814ad6f5cfcff19fb424c26ccf6eeb09c4f4c9eda27dd5903e8b3f24ccdf0aba".into(),
-            approver_id: "drafter_1".into(), nonce: "nonce-vec-0004".into(), expected_state_hash: "unused".into(),
+            approver_id: "drafter_1".into(), nonce: "nonce-vec-0004".into(), expected_state_hash: crate::state::hash_state(&s0),
         };
         let decision = verify(&s0, &action, "drafter_1", &capabilities, &policy);
         match decision {
@@ -294,7 +314,7 @@ mod tests {
         let action = Action::CreateDraft {
             thread_id: "thread_001".into(), invoice_id: "inv_001".into(), customer_id: "cust_001".into(),
             body: "test".into(), body_label: Label::customer("cust_999"),
-            nonce: "nonce-vec-0005".into(), expected_state_hash: "unused".into(),
+            nonce: "nonce-vec-0005".into(), expected_state_hash: crate::state::hash_state(&s0),
         };
         let decision = verify(&s0, &action, "drafter_1", &capabilities, &policy);
         match decision {
@@ -319,7 +339,7 @@ mod tests {
 
         let approve_action = Action::ApproveDraft {
             draft_hash: draft_hash.clone(), approver_id: "approver_1".into(),
-            nonce: "nonce-vec-0002".into(), expected_state_hash: "unused".into(),
+            nonce: "nonce-vec-0002".into(), expected_state_hash: crate::state::hash_state(&s1),
         };
         let approve_decision = verify(&s1, &approve_action, "approver_1", &capabilities, &policy);
         match approve_decision {
@@ -332,7 +352,7 @@ mod tests {
         let submit_action = Action::SubmitDraft {
             draft_hash: draft_hash.clone(), recipient: "billing@example.test".into(),
             recipient_label: Label::customer("cust_001"),
-            nonce: "nonce-vec-0003".into(), expected_state_hash: "unused".into(),
+            nonce: "nonce-vec-0003".into(), expected_state_hash: crate::state::hash_state(&s1),
         };
         let submit_decision = verify(&s1, &submit_action, "approver_1", &capabilities, &policy);
         match submit_decision {
