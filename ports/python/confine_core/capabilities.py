@@ -1,0 +1,31 @@
+"""Capability model (spec PROTOCOL.md sec 8).
+
+Direct port of packages/confine/capabilities.fard's operation_allowed().
+No default-allow: an actor absent from the map, or an operation absent
+from that actor's explicit list, returns False.
+"""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Actor:
+    role: str
+    operations: list
+
+
+@dataclass
+class Capabilities:
+    actors: dict
+
+
+def operation_allowed(capabilities: Capabilities, actor_id: str, operation: str) -> bool:
+    actor = capabilities.actors.get(actor_id)
+    if actor is None:
+        return False
+    return operation in actor.operations
+
+
+def actor_role(capabilities: Capabilities, actor_id: str):
+    actor = capabilities.actors.get(actor_id)
+    return actor.role if actor else None
