@@ -18,7 +18,22 @@ use crate::labels::{flows_to, Label};
 use crate::state::{get_approval, get_draft, get_invoice, get_thread, nonce_consumed, State};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone)]
+impl Obligation {
+    pub fn to_value(&self) -> crate::value::Value {
+        use crate::value::Value;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("t".to_string(), Value::text(self.t.clone()));
+        for (k, v) in &self.data {
+            map.insert(k.clone(), Value::text(v.clone()));
+        }
+        if let Some(label) = &self.label {
+            map.insert("label".to_string(), label.to_value());
+        }
+        Value::Object(map)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Obligation {
     pub t: String,
     pub data: BTreeMap<String, String>,
@@ -39,7 +54,7 @@ pub struct PolicyConfig {
     pub max_total_slack_posts: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Allow { obligations: Vec<Obligation> },
     Deny { code: String },
@@ -222,7 +237,7 @@ mod tests {
         let mut actors = BTreeMap::new();
         actors.insert("drafter_1".to_string(), Actor { role: "drafter".to_string(), operations: vec!["read_invoice".to_string(), "create_draft".to_string()] });
         actors.insert("approver_1".to_string(), Actor { role: "approver".to_string(), operations: vec!["read_invoice".to_string(), "approve_draft".to_string(), "submit_draft".to_string()] });
-        Capabilities { actors }
+        Capabilities { actors, operations_registry: std::collections::BTreeMap::new() }
     }
 
     fn initial_state(policy: &PolicyConfig) -> State {
@@ -362,5 +377,78 @@ mod tests {
             }
             Decision::Deny { code } => panic!("expected allow, got: {}", code),
         }
+    }
+}
+
+// --- Canonical value conversion and digest (spec PROTOCOL.md sec 9) ---
+// Confirmed against real fardrun output (examples/gen_policy_canonical.fard)
+// -- note approved_slack_channels nests each channel as { label: {...} },
+// not the label directly, which was NOT obvious from source alone.
+
+impl PolicyConfig {
+    pub fn to_value(&self) -> crate::value::Value {
+        use crate::value::Value;
+        let mut approved_recipients = std::collections::BTreeMap::new();
+        for (k, v) in &self.approved_recipients {
+            approved_recipients.insert(k.clone(), Value::Array(v.iter().map(|r| Value::text(r.clone())).collect()));
+        }
+        let mut approved_slack_channels = std::collections::BTreeMap::new();
+        for (k, label) in &self.approved_slack_channels {
+            approved_slack_channels.insert(k.clone(), Value::object(vec![("label", label.to_value())]));
+        }
+        Value::object(vec![
+            ("approved_recipients", Value::Object(approved_recipients)),
+            ("approved_slack_channels", Value::Object(approved_slack_channels)),
+            ("approver_role", Value::text(self.approver_role.clone())),
+            ("max_draft_chars", Value::Int(self.max_draft_chars as i64)),
+            ("max_total_drafts", Value::Int(self.max_total_drafts)),
+            ("max_total_slack_posts", Value::Int(self.max_total_slack_posts)),
+            ("max_total_submissions", Value::Int(self.max_total_submissions)),
+            ("min_nonce_length", Value::Int(self.min_nonce_length as i64)),
+            ("require_separation_of_duties", Value::Bool(self.require_separation_of_duties)),
+            ("version", Value::text(self.version.clone())),
+        ])
+    }
+}
+
+pub fn digest(policy: &PolicyConfig) -> String {
+    crate::hash::tagged_digest("confine.policy.v1", &policy.to_value())
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+    use crate::labels::Label;
+
+    #[test]
+    fn confirmed_vector_policy_hash() {
+        let mut approved_recipients = BTreeMap::new();
+        approved_recipients.insert("cust_001".to_string(), vec!["billing@example.test".to_string()]);
+        approved_recipients.insert("cust_002".to_string(), vec!["accounts@example.test".to_string()]);
+        let mut approved_slack_channels = BTreeMap::new();
+        approved_slack_channels.insert("channel-finance".to_string(), Label::internal());
+        let policy = PolicyConfig {
+            version: "invoice-policy-v1".into(), min_nonce_length: 12, max_draft_chars: 2000,
+            max_total_drafts: 100, max_total_submissions: 20, approver_role: "approver".into(),
+            require_separation_of_duties: true, approved_recipients, approved_slack_channels,
+            max_total_slack_posts: 10,
+        };
+        assert_eq!(digest(&policy), "sha256:64d54739cc1ce345d4f9ad87efdcf818612de708830ab2c9ed9847c0b9eb7c5e");
+    }
+}
+
+
+#[cfg(test)]
+mod obligation_diagnostic_tests {
+    use super::*;
+    use crate::labels::Label;
+    use crate::canonical::encode;
+
+    #[test]
+    fn diagnostic_confirmed_create_draft_obligations_canonical() {
+        let obligations = obligations_for_create_draft("cust_001", &Label::customer("cust_001"));
+        let value = crate::value::Value::Array(obligations.iter().map(|o| o.to_value()).collect());
+        let expected = "[{\"customer_id\":\"cust_001\",\"t\":\"bind_customer\"},{\"label\":{\"compartments\":[\"customer_data\"],\"kind\":\"customer\",\"owner\":\"cust_001\"},\"t\":\"body_label\"}]";
+        assert_eq!(encode(&value), expected);
     }
 }
