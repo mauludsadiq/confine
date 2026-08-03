@@ -4,3 +4,7 @@ export { publicLabel, internalLabel, customerLabel, secretLabel, flowsTo } from 
 export { operationAllowed, actorRole } from "./capabilities.js";
 export { makeState, makeDelivery, makeCounters, hashState, getInvoice, getThread, getDraft, getApproval, nonceConsumed } from "./state.js";
 export { verify, obligationsForCreateDraft, obligationsForApproveDraft, obligationsForSubmitDraft } from "./policy.js";
+export { capabilitiesDigest } from "./capabilities.js";
+export { policyDigest } from "./policy.js";
+export { issue, verify as certificateVerify, actionHash } from "./certificate.js";
+export { executeExact, ExecuteError } from "./executor.js";

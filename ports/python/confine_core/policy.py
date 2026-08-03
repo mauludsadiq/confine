@@ -158,3 +158,26 @@ def verify(state, action, actor_id, capabilities, policy):
         ])
 
     return deny("UNKNOWN_ACTION")
+
+
+def _policy_to_dict(policy: PolicyConfig) -> dict:
+    return {
+        "approved_recipients": {k: list(v) for k, v in policy.approved_recipients.items()},
+        "approved_slack_channels": {
+            k: {"label": {"kind": v.kind, "owner": v.owner, "compartments": list(v.compartments)}}
+            for k, v in policy.approved_slack_channels.items()
+        },
+        "approver_role": policy.approver_role,
+        "max_draft_chars": policy.max_draft_chars,
+        "max_total_drafts": policy.max_total_drafts,
+        "max_total_slack_posts": policy.max_total_slack_posts,
+        "max_total_submissions": policy.max_total_submissions,
+        "min_nonce_length": policy.min_nonce_length,
+        "require_separation_of_duties": policy.require_separation_of_duties,
+        "version": policy.version,
+    }
+
+
+def digest(policy: PolicyConfig) -> str:
+    from .hash import tagged_digest
+    return tagged_digest("confine.policy.v1", _policy_to_dict(policy))

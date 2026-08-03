@@ -125,3 +125,29 @@ def test_confirmed_approve_and_submit_allow_full_sequence():
     assert submit_decision["t"] == "allow"
     assert submit_decision["obligations"][0]["t"] == "submit_exact_hash"
     assert submit_decision["obligations"][1]["t"] == "recipient"
+
+
+def test_confirmed_capability_hash():
+    from confine_core.capabilities import Capabilities, Actor, digest as capability_digest
+    actors = {
+        "drafter_1": Actor(role="drafter", operations=["read_invoice", "create_draft"]),
+        "approver_1": Actor(role="approver", operations=["read_invoice", "approve_draft", "submit_draft"]),
+        "poster_1": Actor(role="poster", operations=["post_to_slack"]),
+    }
+    operations_registry = {op: True for op in ["read_invoice", "create_draft", "approve_draft", "submit_draft", "post_to_slack"]}
+    capabilities = Capabilities(actors=actors, operations_registry=operations_registry)
+    assert capability_digest(capabilities) == "sha256:07ffa73a9a69e9d9dcd9850a8d6ed5cdbc4dfff13b7fdbdb880612fa1283ffcb"
+
+
+def test_confirmed_policy_hash():
+    from confine_core.policy import digest as policy_digest
+    from confine_core.labels import internal_label
+    policy = PolicyConfig(
+        version="invoice-policy-v1", min_nonce_length=12, max_draft_chars=2000,
+        max_total_drafts=100, max_total_submissions=20, approver_role="approver",
+        require_separation_of_duties=True,
+        approved_recipients={"cust_001": ["billing@example.test"], "cust_002": ["accounts@example.test"]},
+        approved_slack_channels={"channel-finance": internal_label()},
+        max_total_slack_posts=10,
+    )
+    assert policy_digest(policy) == "sha256:64d54739cc1ce345d4f9ad87efdcf818612de708830ab2c9ed9847c0b9eb7c5e"

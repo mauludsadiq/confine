@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  makeState, makeDelivery, makeCounters, hashState, customerLabel, verify,
+  makeState, makeDelivery, makeCounters, hashState, customerLabel, internalLabel, verify,
+  capabilitiesDigest, policyDigest,
 } from "../src/index.js";
 
 function testPolicy() {
@@ -125,4 +126,28 @@ test("confirmed approve and submit allow full sequence", () => {
   assert.equal(submitDecision.t, "allow");
   assert.equal(submitDecision.obligations[0].t, "submit_exact_hash");
   assert.equal(submitDecision.obligations[1].t, "recipient");
+});
+
+test("confirmed capability_hash", () => {
+  const capabilities = {
+    actors: {
+      drafter_1: { role: "drafter", operations: ["read_invoice", "create_draft"] },
+      approver_1: { role: "approver", operations: ["read_invoice", "approve_draft", "submit_draft"] },
+      poster_1: { role: "poster", operations: ["post_to_slack"] },
+    },
+    operationsRegistry: { read_invoice: true, create_draft: true, approve_draft: true, submit_draft: true, post_to_slack: true },
+  };
+  assert.equal(capabilitiesDigest(capabilities), "sha256:07ffa73a9a69e9d9dcd9850a8d6ed5cdbc4dfff13b7fdbdb880612fa1283ffcb");
+});
+
+test("confirmed policy_hash", () => {
+  const policy = {
+    version: "invoice-policy-v1", minNonceLength: 12, maxDraftChars: 2000,
+    maxTotalDrafts: 100, maxTotalSubmissions: 20, approverRole: "approver",
+    requireSeparationOfDuties: true,
+    approvedRecipients: { cust_001: ["billing@example.test"], cust_002: ["accounts@example.test"] },
+    approvedSlackChannels: { "channel-finance": internalLabel() },
+    maxTotalSlackPosts: 10,
+  };
+  assert.equal(policyDigest(policy), "sha256:64d54739cc1ce345d4f9ad87efdcf818612de708830ab2c9ed9847c0b9eb7c5e");
 });

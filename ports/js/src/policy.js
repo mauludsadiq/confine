@@ -6,6 +6,7 @@
 import { flowsTo } from "./labels.js";
 import { operationAllowed, actorRole } from "./capabilities.js";
 import { getInvoice, getThread, getDraft, getApproval, nonceConsumed, hashState } from "./state.js";
+import { taggedDigest } from "./hash.js";
 
 function deny(code) {
   return { t: "deny", code };
@@ -111,4 +112,31 @@ export function verify(state, action, actorId, capabilities, policy) {
     default:
       return deny("UNKNOWN_ACTION");
   }
+}
+
+export function policyToValue(policy) {
+  const approvedRecipients = {};
+  for (const [k, v] of Object.entries(policy.approvedRecipients)) {
+    approvedRecipients[k] = [...v];
+  }
+  const approvedSlackChannels = {};
+  for (const [k, v] of Object.entries(policy.approvedSlackChannels ?? {})) {
+    approvedSlackChannels[k] = { label: v };
+  }
+  return {
+    approved_recipients: approvedRecipients,
+    approved_slack_channels: approvedSlackChannels,
+    approver_role: policy.approverRole,
+    max_draft_chars: policy.maxDraftChars,
+    max_total_drafts: policy.maxTotalDrafts,
+    max_total_slack_posts: policy.maxTotalSlackPosts ?? 10,
+    max_total_submissions: policy.maxTotalSubmissions,
+    min_nonce_length: policy.minNonceLength,
+    require_separation_of_duties: policy.requireSeparationOfDuties,
+    version: policy.version,
+  };
+}
+
+export function policyDigest(policy) {
+  return taggedDigest("confine.policy.v1", policyToValue(policy));
 }

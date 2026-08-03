@@ -1,10 +1,10 @@
 {
   "name": "confine-core",
   "version": "0.1.0",
-  "description": "Canonical encoding, tagged hashing, HMAC constructions, label lattice, capability model, and policy decision procedure for the confine protocol (spec v2 sections 2-9).",
+  "description": "Canonical encoding, tagged hashing, HMAC constructions, label lattice, capability model, policy decision procedure, certificate issuance/verification, and executor conformance for the confine protocol (spec v2 sections 2-11).",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "test": "node --test test/vectors.test.js test/labels_capabilities.test.js test/policy.test.js"
+    "test": "node --test test/vectors.test.js test/labels_capabilities.test.js test/policy.test.js test/certificate_executor.test.js"
   }
 }
